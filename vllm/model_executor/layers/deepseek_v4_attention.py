@@ -80,6 +80,7 @@ from vllm.v1.attention.backends.mla.sparse_mla_kernels import (
     accumulate_fp8ds_global_slots_sparse_mla_attention_chunk_multihead,
     accumulate_fp8ds_paged_sparse_mla_attention_chunk_multihead,
     accumulate_indexed_sparse_mla_attention_chunk,
+    accumulate_indexed_sparse_mla_attention_chunk_multihead,
     build_combined_sparse_mla_decode_valid_mask,
     finish_sparse_mla_attention_with_sink,
     finish_two_sparse_mla_attention_states_with_sink,
@@ -1365,7 +1366,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     index_start + topk_chunk_size,
                     combined_indices.shape[-1],
                 )
-                accumulate_indexed_sparse_mla_attention_chunk(
+                accumulate_indexed_sparse_mla_attention_chunk_multihead(
                     q=q_chunk,
                     kv_flat=kv_flat,
                     indices=indices_chunk_full[:, index_start:index_end],
@@ -1375,6 +1376,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                     max_score=max_score,
                     denom=denom,
                     acc=subset_acc,
+                    head_block_size=8,
                 )
 
             finish_sparse_mla_attention_with_sink(

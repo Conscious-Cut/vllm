@@ -388,6 +388,7 @@ def _sm120_fp8_paged_mqa_logits_triton(
     context_lens: torch.Tensor,
     block_tables: torch.Tensor,
     max_model_len: int,
+    clean_logits: bool,
 ) -> torch.Tensor | None:
     if not (
         q.is_cuda
@@ -405,12 +406,16 @@ def _sm120_fp8_paged_mqa_logits_triton(
     if cache_width < head_dim + 4:
         return None
 
-    logits = torch.full(
-        (batch_size * next_n, max_model_len),
-        float("-inf"),
-        dtype=torch.float32,
-        device=q.device,
-    )
+    logits_shape = (batch_size * next_n, max_model_len)
+    if clean_logits:
+        logits = torch.full(
+            logits_shape,
+            float("-inf"),
+            dtype=torch.float32,
+            device=q.device,
+        )
+    else:
+        logits = torch.empty(logits_shape, dtype=torch.float32, device=q.device)
     if batch_size == 0 or next_n == 0 or max_model_len == 0:
         return logits
 
@@ -962,6 +967,7 @@ def fp8_fp4_paged_mqa_logits(
             context_lens,
             block_tables,
             max_model_len,
+            clean_logits,
         )
         if triton_logits is not None:
             return triton_logits
