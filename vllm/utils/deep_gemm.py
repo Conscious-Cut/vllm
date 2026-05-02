@@ -20,6 +20,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
     get_fp8_min_max,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_deep_gemm
 from vllm.utils.math_utils import cdiv
 
@@ -276,6 +277,365 @@ def _sm120_fp8_paged_mqa_logits_fallback(
     return logits
 
 
+@triton.jit
+def _sm120_fp8_paged_mqa_logits_kernel(
+    q_ptr,
+    kv_cache_ptr,
+    weights_ptr,
+    context_lens_ptr,
+    block_tables_ptr,
+    logits_ptr,
+    q_stride_b: tl.constexpr,
+    q_stride_n: tl.constexpr,
+    q_stride_h: tl.constexpr,
+    q_stride_d: tl.constexpr,
+    kv_stride_block: tl.constexpr,
+    kv_stride_pos: tl.constexpr,
+    kv_stride_head: tl.constexpr,
+    kv_stride_dim: tl.constexpr,
+    weights_stride_row: tl.constexpr,
+    weights_stride_h: tl.constexpr,
+    context_stride_b: tl.constexpr,
+    context_stride_n: tl.constexpr,
+    block_table_stride_b: tl.constexpr,
+    logits_stride_row: tl.constexpr,
+    next_n: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    block_size: tl.constexpr,
+    max_model_len: tl.constexpr,
+    CONTEXT_LENS_2D: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    row = tl.program_id(0)
+    key_block = tl.program_id(1)
+    batch_idx = row // next_n
+    next_idx = row - batch_idx * next_n
+
+    key_offsets = key_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    if CONTEXT_LENS_2D:
+        context_len = tl.load(
+            context_lens_ptr
+            + batch_idx * context_stride_b
+            + next_idx * context_stride_n
+        )
+    else:
+        context_len = tl.load(context_lens_ptr + batch_idx * context_stride_b)
+    key_mask = (key_offsets < context_len) & (key_offsets < max_model_len)
+
+    block_offsets = key_offsets // block_size
+    pos_offsets = key_offsets - block_offsets * block_size
+    physical_blocks = tl.load(
+        block_tables_ptr + batch_idx * block_table_stride_b + block_offsets,
+        mask=key_mask,
+        other=0,
+    )
+
+    head_offsets = tl.arange(0, BLOCK_H)
+    dim_offsets = tl.arange(0, BLOCK_D)
+    head_mask = head_offsets < num_heads
+    dim_mask = dim_offsets < head_dim
+
+    q = tl.load(
+        q_ptr
+        + batch_idx * q_stride_b
+        + next_idx * q_stride_n
+        + head_offsets[:, None] * q_stride_h
+        + dim_offsets[None, :] * q_stride_d,
+        mask=head_mask[:, None] & dim_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+
+    k_uint8 = tl.load(
+        kv_cache_ptr
+        + physical_blocks[None, :].to(tl.int64) * kv_stride_block
+        + pos_offsets[None, :] * head_dim
+        + dim_offsets[:, None],
+        mask=dim_mask[:, None] & key_mask[None, :],
+        other=0,
+    )
+    k = k_uint8.to(tl.float8e4nv, bitcast=True).to(tl.float32)
+    scale_ptr = (
+        kv_cache_ptr
+        + physical_blocks.to(tl.int64) * kv_stride_block
+        + block_size * head_dim
+        + pos_offsets * 4
+    ).to(tl.pointer_type(tl.float32))
+    scale = tl.load(scale_ptr, mask=key_mask, other=0.0)
+    k = k * scale[None, :]
+
+    scores = tl.dot(q, k, out_dtype=tl.float32, input_precision="tf32")
+    weights = tl.load(
+        weights_ptr + row * weights_stride_row + head_offsets * weights_stride_h,
+        mask=head_mask,
+        other=0.0,
+    )
+    scores = tl.maximum(scores, 0.0) * weights[:, None]
+    logits = tl.sum(scores, axis=0)
+    tl.store(
+        logits_ptr + row * logits_stride_row + key_offsets,
+        logits,
+        mask=key_mask,
+    )
+
+
+def _sm120_fp8_paged_mqa_logits_triton(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor | None:
+    if not (
+        q.is_cuda
+        and q.dtype == current_platform.fp8_dtype()
+        and kv_cache.dtype == torch.uint8
+        and q.dim() == 4
+        and kv_cache.dim() == 4
+        and q.shape[3] == 128
+        and q.shape[2] <= 64
+    ):
+        return None
+
+    batch_size, next_n, num_heads, head_dim = q.shape
+    _, block_size, _, cache_width = kv_cache.shape
+    if cache_width < head_dim + 4:
+        return None
+
+    logits = torch.full(
+        (batch_size * next_n, max_model_len),
+        float("-inf"),
+        dtype=torch.float32,
+        device=q.device,
+    )
+    if batch_size == 0 or next_n == 0 or max_model_len == 0:
+        return logits
+
+    block_n = 32
+    block_h = triton.next_power_of_2(num_heads)
+    grid = (batch_size * next_n, triton.cdiv(max_model_len, block_n))
+    _sm120_fp8_paged_mqa_logits_kernel[grid](
+        q,
+        kv_cache,
+        weights,
+        context_lens,
+        block_tables,
+        logits,
+        q.stride(0),
+        q.stride(1),
+        q.stride(2),
+        q.stride(3),
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        kv_cache.stride(2),
+        kv_cache.stride(3),
+        weights.stride(0),
+        weights.stride(1),
+        context_lens.stride(0),
+        context_lens.stride(1) if context_lens.dim() == 2 else 0,
+        block_tables.stride(0),
+        logits.stride(0),
+        next_n,
+        num_heads,
+        head_dim,
+        block_size,
+        max_model_len,
+        CONTEXT_LENS_2D=context_lens.dim() == 2,
+        BLOCK_H=block_h,
+        BLOCK_D=triton.next_power_of_2(head_dim),
+        BLOCK_N=block_n,
+        num_warps=8,
+        num_stages=3,
+    )
+    return logits
+
+
+_SM120_MQA_LOGITS_MAX_SCORE_BYTES = 64 * 1024 * 1024
+
+
+def _fp8_mqa_logits_head_chunk_size(
+    seq_len: int,
+    seq_len_kv: int,
+    num_heads: int,
+) -> int:
+    score_elems_per_head = max(1, seq_len * seq_len_kv)
+    max_heads = _SM120_MQA_LOGITS_MAX_SCORE_BYTES // (score_elems_per_head * 4)
+    return max(1, min(8, num_heads, max_heads))
+
+
+def _fp8_mqa_logits_k_chunk_size(
+    seq_len: int,
+    seq_len_kv: int,
+    head_chunk_size: int,
+) -> int:
+    score_elems_per_key = max(1, seq_len * head_chunk_size)
+    max_keys = _SM120_MQA_LOGITS_MAX_SCORE_BYTES // (score_elems_per_key * 4)
+    return max(1, min(seq_len_kv, max_keys))
+
+
+def _fp8_mqa_logits_torch(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    clean_logits: bool,
+) -> torch.Tensor:
+    q_values, q_scale = q
+    if q_scale is not None:
+        raise NotImplementedError("SM120 MQA logits torch path only supports FP8 Q")
+
+    k_values, k_scales = kv
+    k_f32 = k_values.to(torch.float32)
+    k_f32.mul_(k_scales.reshape(-1, 1).to(torch.float32))
+    k_t = k_f32.transpose(0, 1).contiguous()
+
+    seq_len, num_heads, _ = q_values.shape
+    seq_len_kv = k_f32.shape[0]
+    logits = torch.zeros(
+        (seq_len, seq_len_kv), device=q_values.device, dtype=torch.float32
+    )
+    head_chunk_size = _fp8_mqa_logits_head_chunk_size(
+        seq_len, seq_len_kv, num_heads
+    )
+
+    for head_start in range(0, num_heads, head_chunk_size):
+        head_end = min(head_start + head_chunk_size, num_heads)
+        q_chunk = q_values[:, head_start:head_end, :].to(torch.float32)
+        q_chunk = q_chunk.transpose(0, 1).contiguous()
+        head_weights = weights[:, head_start:head_end].transpose(0, 1).unsqueeze(-1)
+        k_chunk_size = _fp8_mqa_logits_k_chunk_size(
+            seq_len, seq_len_kv, head_end - head_start
+        )
+        for k_start in range(0, seq_len_kv, k_chunk_size):
+            k_end = min(k_start + k_chunk_size, seq_len_kv)
+            scores = torch.matmul(q_chunk, k_t[:, k_start:k_end])
+            scores.relu_()
+            scores.mul_(head_weights)
+            logits[:, k_start:k_end].add_(
+                scores[0] if scores.shape[0] == 1 else scores.sum(dim=0)
+            )
+
+    if clean_logits:
+        offsets = torch.arange(seq_len_kv, device=q_values.device)
+        valid = (offsets[None, :] >= cu_seqlen_ks[:, None]) & (
+            offsets[None, :] < cu_seqlen_ke[:, None]
+        )
+        logits = logits.masked_fill(~valid, float("-inf"))
+
+    return logits
+
+
+def _fp8_mqa_logits_topk_torch(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk_tokens: int,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    q_values, q_scale = q
+    if q_scale is not None:
+        raise NotImplementedError("SM120 MQA top-k torch path only supports FP8 Q")
+
+    k_values, k_scales = kv
+    k_f32 = k_values.to(torch.float32)
+    k_f32.mul_(k_scales.reshape(-1, 1).to(torch.float32))
+    k_t = k_f32.transpose(0, 1).contiguous()
+
+    seq_len, num_heads, _ = q_values.shape
+    seq_len_kv = k_f32.shape[0]
+    if out is None:
+        out = torch.empty(
+            (seq_len, topk_tokens), device=q_values.device, dtype=torch.int32
+        )
+    else:
+        assert out.shape == (seq_len, topk_tokens)
+        assert out.dtype == torch.int32
+    out.fill_(-1)
+
+    best_values = torch.full(
+        (seq_len, topk_tokens),
+        float("-inf"),
+        device=q_values.device,
+        dtype=torch.float32,
+    )
+    head_chunk_size = _fp8_mqa_logits_head_chunk_size(
+        seq_len, seq_len_kv, num_heads
+    )
+    k_chunk_size = _fp8_mqa_logits_k_chunk_size(
+        seq_len, seq_len_kv, head_chunk_size
+    )
+
+    for k_start in range(0, seq_len_kv, k_chunk_size):
+        k_end = min(k_start + k_chunk_size, seq_len_kv)
+        chunk_logits = torch.zeros(
+            (seq_len, k_end - k_start),
+            device=q_values.device,
+            dtype=torch.float32,
+        )
+        for head_start in range(0, num_heads, head_chunk_size):
+            head_end = min(head_start + head_chunk_size, num_heads)
+            q_chunk = q_values[:, head_start:head_end, :].to(torch.float32)
+            q_chunk = q_chunk.transpose(0, 1).contiguous()
+            head_weights = weights[:, head_start:head_end].transpose(0, 1).unsqueeze(-1)
+            scores = torch.matmul(q_chunk, k_t[:, k_start:k_end])
+            scores.relu_()
+            scores.mul_(head_weights)
+            chunk_logits.add_(
+                scores[0] if scores.shape[0] == 1 else scores.sum(dim=0)
+            )
+
+        offsets = torch.arange(k_start, k_end, device=q_values.device)
+        valid = (offsets[None, :] >= cu_seqlen_ks[:, None]) & (
+            offsets[None, :] < cu_seqlen_ke[:, None]
+        )
+        chunk_logits.masked_fill_(~valid, float("-inf"))
+
+        chunk_topk = min(topk_tokens, k_end - k_start)
+        chunk_values, chunk_indices = torch.topk(chunk_logits, chunk_topk, dim=1)
+        chunk_indices = (chunk_indices + k_start).to(torch.int32)
+
+        candidate_values = torch.cat((best_values, chunk_values), dim=1)
+        candidate_indices = torch.cat((out, chunk_indices), dim=1)
+        best_values, selected = torch.topk(candidate_values, topk_tokens, dim=1)
+        out.copy_(candidate_indices.gather(1, selected))
+        out.masked_fill_(~torch.isfinite(best_values), -1)
+
+    return out
+
+
+def fp8_fp4_mqa_topk_indices(
+    q: tuple[torch.Tensor, torch.Tensor | None],
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+    topk_indices: torch.Tensor,
+) -> bool:
+    """Write SM120 FP8 MQA top-k indices without materializing full logits."""
+    if not (
+        current_platform.is_cuda()
+        and current_platform.is_device_capability_family(120)
+        and q[1] is None
+    ):
+        return False
+    _fp8_mqa_logits_topk_torch(
+        q,
+        kv,
+        weights,
+        cu_seqlen_ks,
+        cu_seqlen_ke,
+        topk_indices.shape[1],
+        out=topk_indices,
+    )
+    return True
+
+
 def _import_deep_gemm():
     """Import the deep_gemm module.
 
@@ -508,8 +868,12 @@ def fp8_fp4_mqa_logits(
     """
     q_values, q_scale = q
     if q_scale is None and _use_sm120_mqa_fallback(q_values):
-        return _sm120_fp8_mqa_logits_fallback(
-            q_values, kv, weights, cu_seqlen_ks, cu_seqlen_ke
+        logger.warning_once(
+            "Using Torch FP8 MQA logits fallback on SM120 because DeepGEMM "
+            "indexing kernels do not support this architecture."
+        )
+        return _fp8_mqa_logits_torch(
+            q, kv, weights, cu_seqlen_ks, cu_seqlen_ke, clean_logits
         )
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
@@ -591,6 +955,16 @@ def fp8_fp4_paged_mqa_logits(
     """
     q_values, q_scale = q
     if q_scale is None and _use_sm120_mqa_fallback(q_values):
+        triton_logits = _sm120_fp8_paged_mqa_logits_triton(
+            q_values,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+        )
+        if triton_logits is not None:
+            return triton_logits
         return _sm120_fp8_paged_mqa_logits_fallback(
             q_values,
             kv_cache,
@@ -727,6 +1101,7 @@ __all__ = [
     "m_grouped_fp8_fp4_gemm_nt_contiguous",
     "fp8_m_grouped_gemm_nt_masked",
     "fp8_fp4_mqa_logits",
+    "fp8_fp4_mqa_topk_indices",
     "fp8_fp4_paged_mqa_logits",
     "get_paged_mqa_logits_metadata",
     "per_block_cast_to_fp8",

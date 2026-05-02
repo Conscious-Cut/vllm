@@ -18,6 +18,7 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     FusedMoEQuantDesc,
+    RoutingMethodType,
     mxfp4_moe_quant_config,
     mxfp4_mxfp8_moe_quant_config,
     mxfp4_w4a16_moe_quant_config,
@@ -240,6 +241,24 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
         Mxfp4MoeBackend.BATCHED_MARLIN,
     ]
     return _AVAILABLE_BACKENDS
+
+
+def _get_priority_backends_for_config(
+    config: FusedMoEConfig,
+) -> list[Mxfp4MoeBackend]:
+    if (
+        current_platform.is_device_capability(120)
+        and config.routing_method == RoutingMethodType.DeepseekV4
+        and not config.has_bias
+    ):
+        return [
+            Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
+            Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+            Mxfp4MoeBackend.MARLIN,
+            Mxfp4MoeBackend.CUTLASS_MXFP4,
+            Mxfp4MoeBackend.BATCHED_MARLIN,
+        ]
+    return _get_priority_backends()
 
 
 def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
@@ -504,7 +523,7 @@ def select_mxfp4_moe_backend(
         )
 
     # Iterate priority backends: TRTLLM MXFP8, then Triton.
-    for backend in _get_priority_backends():
+    for backend in _get_priority_backends_for_config(config):
         if backend == Mxfp4MoeBackend.CUTLASS_MXFP4 and config.has_bias:
             logger.debug_once(
                 _make_log_unsupported(backend, "kernel does not support bias"),
