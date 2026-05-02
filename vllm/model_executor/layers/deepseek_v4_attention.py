@@ -81,6 +81,7 @@ logger = init_logger(__name__)
 # workspace allocated at _forward_prefill (and the matching profile-time
 # reservation in attention_impl's dummy-run branch).
 PREFILL_CHUNK_SIZE = 4
+_FP8_EINSUM_WEIGHT_CACHE: dict[tuple[Any, ...], torch.Tensor] = {}
 
 
 @dataclass
@@ -562,6 +563,248 @@ direct_register_custom_op(
 )
 
 
+def _is_sm120_tensor(tensor: torch.Tensor) -> bool:
+    if not tensor.is_cuda:
+        return False
+    device_index = tensor.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    major, _ = torch.cuda.get_device_capability(device_index)
+    return major == 12
+
+
+_DS_MLA_FP8_DIM = 448
+_DS_MLA_BF16_DIM = 64
+_DS_MLA_SCALE_DIM = 8
+_DS_MLA_TOKEN_DATA_SIZE = _DS_MLA_FP8_DIM + _DS_MLA_BF16_DIM * 2
+_DS_MLA_QUANT_BLOCK_SIZE = 64
+
+
+def _ds_mla_cache_views(k_cache: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    num_blocks, block_size, _ = k_cache.shape
+    block_stride = k_cache.stride(0)
+    storage_offset = k_cache.storage_offset()
+    token_data = torch.as_strided(
+        k_cache,
+        size=(num_blocks, block_size, _DS_MLA_TOKEN_DATA_SIZE),
+        stride=(block_stride, _DS_MLA_TOKEN_DATA_SIZE, 1),
+        storage_offset=storage_offset,
+    )
+    token_scales = torch.as_strided(
+        k_cache,
+        size=(num_blocks, block_size, _DS_MLA_SCALE_DIM),
+        stride=(block_stride, _DS_MLA_SCALE_DIM, 1),
+        storage_offset=storage_offset + block_size * _DS_MLA_TOKEN_DATA_SIZE,
+    )
+    return token_data, token_scales
+
+
+def _dequantize_ds_mla_cache_indices(
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+) -> torch.Tensor:
+    if indices.dim() == 3:
+        assert indices.shape[1] == 1
+        indices = indices.squeeze(1)
+
+    token_data, token_scales = _ds_mla_cache_views(k_cache)
+    block_size = k_cache.shape[1]
+    num_slots = k_cache.shape[0] * block_size
+    safe_indices = indices.to(torch.int64).clamp(min=0, max=num_slots - 1)
+    block_idx = torch.div(safe_indices, block_size, rounding_mode="floor")
+    block_offset = safe_indices % block_size
+
+    data = token_data[block_idx, block_offset]
+    scale_bytes = token_scales[block_idx, block_offset][..., :7]
+
+    fp8_values = data[..., :_DS_MLA_FP8_DIM].contiguous().view(
+        torch.float8_e4m3fn
+    )
+    scale_bits = scale_bytes.to(torch.int32) << 23
+    scales = scale_bits.view(torch.float32)
+    fp8_dequant = (
+        fp8_values.float().reshape(
+            *indices.shape, 7, _DS_MLA_QUANT_BLOCK_SIZE
+        )
+        * scales.unsqueeze(-1)
+    ).reshape(*indices.shape, _DS_MLA_FP8_DIM)
+
+    bf16_values = (
+        data[..., _DS_MLA_FP8_DIM : _DS_MLA_TOKEN_DATA_SIZE]
+        .contiguous()
+        .view(torch.bfloat16)
+    )
+    return torch.cat((fp8_dequant.to(torch.bfloat16), bf16_values), dim=-1)
+
+
+def _sparse_attention_gathered_torch(
+    q: torch.Tensor,
+    gathered_kv: torch.Tensor,
+    valid_mask: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    num_tokens, num_heads, _ = q.shape
+    chunk_size = 16
+    sink = attn_sink[:num_heads].to(torch.float32).view(1, num_heads, 1)
+
+    for start in range(0, num_tokens, chunk_size):
+        end = min(start + chunk_size, num_tokens)
+        q_chunk = q[start:end].to(torch.float32)
+        kv_chunk = gathered_kv[start:end].to(torch.float32)
+        valid = valid_mask[start:end].unsqueeze(1)
+        scores = torch.einsum("thd,tkd->thk", q_chunk, kv_chunk) * scale
+        scores = scores.masked_fill(~valid, float("-inf"))
+
+        sink_chunk = sink.expand(end - start, -1, -1)
+        max_score = torch.maximum(scores.amax(dim=-1, keepdim=True), sink_chunk)
+        safe_max = torch.where(
+            torch.isfinite(max_score), max_score, torch.zeros_like(max_score)
+        )
+        exp_scores = torch.exp(scores - safe_max) * valid
+        exp_sink = torch.where(
+            torch.isfinite(sink_chunk),
+            torch.exp(sink_chunk - safe_max),
+            torch.zeros_like(safe_max),
+        )
+        denom = exp_scores.sum(dim=-1, keepdim=True) + exp_sink
+        weighted = torch.einsum("thk,tkd->thd", exp_scores, kv_chunk)
+        result = torch.where(
+            denom > 0,
+            weighted / denom.clamp_min(1e-20),
+            torch.zeros_like(weighted),
+        )
+        out[start:end].copy_(result.to(out.dtype))
+
+
+def _sparse_attention_indexed_torch(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor,
+    out: torch.Tensor,
+) -> None:
+    if indices.dim() == 3:
+        assert indices.shape[1] == 1
+        indices = indices.squeeze(1)
+    kv_flat = kv.squeeze(1) if kv.dim() == 3 and kv.shape[1] == 1 else kv
+    num_tokens = q.shape[0]
+    num_indices = indices.shape[-1]
+    index_offsets = torch.arange(num_indices, device=q.device, dtype=torch.int32)
+    chunk_size = 16
+
+    for start in range(0, num_tokens, chunk_size):
+        end = min(start + chunk_size, num_tokens)
+        idx = indices[start:end]
+        valid = (idx >= 0) & (index_offsets.unsqueeze(0) < topk_length[start:end, None])
+        safe_idx = idx.to(torch.int64).clamp(min=0, max=kv_flat.shape[0] - 1)
+        gathered = kv_flat[safe_idx]
+        _sparse_attention_gathered_torch(
+            q[start:end],
+            gathered,
+            valid,
+            scale,
+            attn_sink,
+            out[start:end],
+        )
+
+
+def _upcast_e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
+    exp_bits = scale.view(torch.uint8).to(torch.int32)
+    return (exp_bits << 23).view(torch.float32)
+
+
+def _unpack_e8m0_scales(scale: torch.Tensor, num_blocks: int) -> torch.Tensor:
+    shifts = torch.arange(4, device=scale.device, dtype=torch.int32) * 8
+    packed = scale.to(torch.int32).unsqueeze(-1)
+    exp_bits = ((packed >> shifts) & 0xFF).to(torch.int32)
+    scales = (exp_bits << 23).view(torch.float32).flatten(-2)
+    return scales[..., :num_blocks]
+
+
+def _scale_blocks_fp32(scale: torch.Tensor, num_blocks: int) -> torch.Tensor:
+    if scale.dtype == torch.int32:
+        return _unpack_e8m0_scales(scale, num_blocks)
+    if scale.dtype == torch.float8_e8m0fnu:
+        scale = _upcast_e8m0_to_fp32(scale)
+    return scale.to(torch.float32)
+
+
+def _dequant_fp8_einsum_a(a: torch.Tensor, a_scale: torch.Tensor) -> torch.Tensor:
+    group_size = 128
+    r = a.shape[-1]
+    r_blocks = r // group_size
+    a_scale = _scale_blocks_fp32(a_scale, r_blocks)
+    return (
+        a.float().reshape(*a.shape[:-1], r_blocks, group_size)
+        * a_scale.unsqueeze(-1)
+    ).reshape_as(a).to(torch.bfloat16)
+
+
+def _dequant_fp8_einsum_b(
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    h: int,
+    d: int,
+    r: int,
+) -> torch.Tensor:
+    group_size = 128
+    d_blocks = d // group_size
+    r_blocks = r // group_size
+    cache_key = (
+        b.data_ptr(),
+        b_scale.data_ptr(),
+        tuple(b.shape),
+        tuple(b_scale.shape),
+        b.dtype,
+        b_scale.dtype,
+        h,
+        d,
+        r,
+    )
+    cached = _FP8_EINSUM_WEIGHT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    b = b.reshape(h, d, r)
+    b_scale = _scale_blocks_fp32(b_scale, r_blocks)
+    if b_scale.dim() == 2:
+        b_scale = b_scale.reshape(h, d_blocks, r_blocks)
+    else:
+        b_scale = b_scale.reshape(h, d_blocks, r_blocks)
+
+    dequant = (
+        b.float().reshape(h, d_blocks, group_size, r_blocks, group_size)
+        * b_scale[:, :, None, :, None]
+    ).reshape(h, d, r).to(torch.bfloat16)
+    _FP8_EINSUM_WEIGHT_CACHE[cache_key] = dequant
+    return dequant
+
+
+def _deepseek_v4_fp8_einsum_torch_fallback(
+    a: torch.Tensor,
+    a_scale: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+    equation: str,
+) -> None:
+    assert equation == "bhr,hdr->bhd"
+    batch, h, r = a.shape
+    assert out.shape[0] == batch and out.shape[1] == h
+    d = out.shape[2]
+    a_dequant = _dequant_fp8_einsum_a(a, a_scale)
+    b_dequant = _dequant_fp8_einsum_b(b, b_scale, h, d, r)
+    result = torch.bmm(
+        a_dequant.permute(1, 0, 2),
+        b_dequant.transpose(1, 2),
+    ).permute(1, 0, 2)
+    out.copy_(result)
+
+
 def deepseek_v4_fp8_einsum(
     a: torch.Tensor,
     a_scale: torch.Tensor,
@@ -571,6 +814,11 @@ def deepseek_v4_fp8_einsum(
     equation: str,
     recipe: list[int],
 ) -> None:
+    if _is_sm120_tensor(a):
+        _deepseek_v4_fp8_einsum_torch_fallback(
+            a, a_scale, b, b_scale, out, equation
+        )
+        return
     fp8_einsum(equation, (a, a_scale), (b, b_scale), out, recipe=tuple(recipe))
 
 
@@ -825,8 +1073,22 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
         # Use unsqueeze to preserve strides (handles padded blocks correctly)
         swa_cache = self.swa_cache_layer.kv_cache.unsqueeze(-2)
         # Reshape KV cache to (num_blocks, block_size, 1, head_bytes)
+        compressed_k_cache = kv_cache
         if kv_cache is not None:
             kv_cache = kv_cache.unsqueeze(-2)
+
+        if _is_sm120_tensor(q):
+            self._forward_decode_torch(
+                q=q.squeeze(1),
+                compressed_k_cache=compressed_k_cache,
+                swa_k_cache=self.swa_cache_layer.kv_cache,
+                topk_indices=topk_indices,
+                topk_lens=topk_lens,
+                swa_indices=swa_indices,
+                swa_lens=swa_lens,
+                output=output,
+            )
+            return
 
         # One FlashMLASchedMeta per layer type, shared across all same-type
         # layers within this decode step. The first forward call per type
@@ -868,6 +1130,61 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             extra_indices_in_kvcache=topk_indices,
             extra_topk_length=topk_lens,
             out=output.unsqueeze(1),
+        )
+
+    def _forward_decode_torch(
+        self,
+        q: torch.Tensor,
+        compressed_k_cache: torch.Tensor | None,
+        swa_k_cache: torch.Tensor,
+        topk_indices: torch.Tensor | None,
+        topk_lens: torch.Tensor | None,
+        swa_indices: torch.Tensor,
+        swa_lens: torch.Tensor,
+        output: torch.Tensor,
+    ) -> None:
+        if swa_indices.dim() == 3:
+            assert swa_indices.shape[1] == 1
+            swa_indices = swa_indices.squeeze(1)
+
+        swa_valid_offsets = torch.arange(
+            swa_indices.shape[-1], device=q.device, dtype=torch.int32
+        )
+        swa_valid = (swa_indices >= 0) & (
+            swa_valid_offsets.unsqueeze(0) < swa_lens.unsqueeze(1)
+        )
+        gathered_parts = [
+            _dequantize_ds_mla_cache_indices(swa_k_cache, swa_indices),
+        ]
+        valid_parts = [swa_valid]
+
+        if topk_indices is not None:
+            assert compressed_k_cache is not None
+            assert topk_lens is not None
+            if topk_indices.dim() == 3:
+                assert topk_indices.shape[1] == 1
+                topk_indices = topk_indices.squeeze(1)
+            topk_valid_offsets = torch.arange(
+                topk_indices.shape[-1], device=q.device, dtype=torch.int32
+            )
+            topk_valid = (topk_indices >= 0) & (
+                topk_valid_offsets.unsqueeze(0) < topk_lens.unsqueeze(1)
+            )
+            gathered_parts.insert(
+                0,
+                _dequantize_ds_mla_cache_indices(compressed_k_cache, topk_indices),
+            )
+            valid_parts.insert(0, topk_valid)
+
+        gathered = torch.cat(gathered_parts, dim=1)
+        valid = torch.cat(valid_parts, dim=1)
+        _sparse_attention_gathered_torch(
+            q=q,
+            gathered_kv=gathered,
+            valid_mask=valid,
+            scale=self.scale,
+            attn_sink=self.attn_sink,
+            out=output,
         )
 
     def _forward_prefill(
@@ -980,15 +1297,26 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 N,
             )
 
-            output_chunk, _, _ = flash_mla_sparse_fwd(
-                q=q[query_start:query_end],
-                kv=kv.view(-1, 1, q.shape[-1]),
-                indices=combined_indices.unsqueeze(1),
-                sm_scale=self.scale,
-                attn_sink=self.attn_sink,
-                topk_length=combined_lens,
-                out=output[query_start:query_end],
-            )
+            if _is_sm120_tensor(q):
+                _sparse_attention_indexed_torch(
+                    q=q[query_start:query_end],
+                    kv=kv[:chunk_size].reshape(-1, 1, q.shape[-1]),
+                    indices=combined_indices.unsqueeze(1),
+                    topk_length=combined_lens,
+                    scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    out=output[query_start:query_end],
+                )
+            else:
+                output_chunk, _, _ = flash_mla_sparse_fwd(
+                    q=q[query_start:query_end],
+                    kv=kv.view(-1, 1, q.shape[-1]),
+                    indices=combined_indices.unsqueeze(1),
+                    sm_scale=self.scale,
+                    attn_sink=self.attn_sink,
+                    topk_length=combined_lens,
+                    out=output[query_start:query_end],
+                )
 
 
 class DeepseekV4IndexerCache(torch.nn.Module, AttentionLayerBase):

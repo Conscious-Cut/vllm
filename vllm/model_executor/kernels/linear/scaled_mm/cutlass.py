@@ -193,6 +193,9 @@ class CutlassFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             column_major_scales=True,
         )
         self.is_hopper = current_platform.is_device_capability(90)
+        self.use_triton_block_fallback = current_platform.is_device_capability_family(
+            120
+        )
 
     @classmethod
     def is_supported(cls, compute_capability=None):
@@ -219,6 +222,31 @@ class CutlassFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
             )
         return True, None
 
+    def process_weights_after_loading(self, layer: torch.nn.Module) -> None:
+        super().process_weights_after_loading(layer)
+        if not self.use_triton_block_fallback:
+            return
+
+        params = self._get_layer_params(layer)
+        weight_scale = (
+            params.weight_scale
+            if params.weight_scale_inv is None
+            else params.weight_scale_inv
+        )
+        if weight_scale is None or weight_scale.dtype != torch.float8_e8m0fnu:
+            return
+
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            _upcast_e8m0_to_fp32,
+        )
+
+        scale_attr_name = (
+            params.WEIGHT_SCALE
+            if params.weight_scale_inv is None
+            else params.WEIGHT_SCALE_INV
+        )
+        replace_parameter(layer, scale_attr_name, _upcast_e8m0_to_fp32(weight_scale))
+
     def apply_block_scaled_mm(
         self,
         A: torch.Tensor,
@@ -227,6 +255,15 @@ class CutlassFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         Bs: torch.Tensor,
     ) -> torch.Tensor:
         out_dtype = self.config.out_dtype
+        if self.use_triton_block_fallback:
+            return torch.ops.vllm.w8a8_triton_block_scaled_mm_func(
+                A,
+                B,
+                As,
+                Bs,
+                list(self.weight_group_shape),
+                out_dtype,
+            )
         if self.is_hopper:
             return torch.ops.vllm.padded_cutlass(
                 A,

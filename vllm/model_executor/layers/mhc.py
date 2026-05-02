@@ -178,6 +178,78 @@ def mhc_pre_big_fuse_tilelang(
         T.pdl_trigger()
 
 
+def _use_torch_mhc_pre_fallback(residual: torch.Tensor) -> bool:
+    if not residual.is_cuda:
+        return False
+    device_index = residual.device.index
+    if device_index is None:
+        device_index = torch.cuda.current_device()
+    major, _ = torch.cuda.get_device_capability(device_index)
+    return major == 12
+
+
+def _mhc_pre_torch_fallback(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    outer_shape = residual.shape[:-2]
+
+    residual_flat = residual.view(-1, hc_mult, hidden_size)
+    num_tokens = residual_flat.shape[0]
+    hc_hidden_size = hc_mult * hidden_size
+
+    residual_float = residual_flat.float()
+    residual_flat_float = residual_float.view(num_tokens, hc_hidden_size)
+    sqrsum = residual_flat_float.square().sum(dim=-1)
+    rms = torch.rsqrt(sqrsum / hc_hidden_size + rms_eps)
+    mixes = torch.mm(residual_flat_float, fn.t())
+    mixes = mixes * rms.unsqueeze(-1)
+
+    pre_mix = (
+        torch.sigmoid(mixes[:, :hc_mult] * hc_scale[0] + hc_base[:hc_mult])
+        + hc_pre_eps
+    )
+    layer_input = (pre_mix.unsqueeze(-1) * residual_float).sum(dim=1).to(
+        torch.bfloat16
+    )
+
+    post_offset = hc_mult
+    comb_offset = hc_mult * 2
+    post_mix = (
+        torch.sigmoid(
+            mixes[:, post_offset:comb_offset] * hc_scale[1]
+            + hc_base[post_offset:comb_offset]
+        )
+        * hc_post_mult_value
+    )
+
+    comb_mix = (
+        mixes[:, comb_offset:].view(num_tokens, hc_mult, hc_mult) * hc_scale[2]
+        + hc_base[comb_offset:].view(hc_mult, hc_mult)
+    )
+    comb_mix = torch.softmax(comb_mix, dim=-1) + hc_sinkhorn_eps
+    comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+
+    for _ in range(sinkhorn_repeat - 1):
+        comb_mix = comb_mix / (comb_mix.sum(dim=-1, keepdim=True) + hc_sinkhorn_eps)
+        comb_mix = comb_mix / (comb_mix.sum(dim=-2, keepdim=True) + hc_sinkhorn_eps)
+
+    post_mix = post_mix.view(*outer_shape, hc_mult, 1)
+    comb_mix = comb_mix.view(*outer_shape, hc_mult, hc_mult)
+    layer_input = layer_input.view(*outer_shape, hidden_size)
+
+    return post_mix, comb_mix, layer_input
+
+
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -227,6 +299,19 @@ def mhc_pre(
     assert fn.shape[1] == hc_hidden_size
     assert hc_scale.shape == (3,)
     assert hc_base.shape == (hc_mult3,)
+
+    if _use_torch_mhc_pre_fallback(residual):
+        return _mhc_pre_torch_fallback(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
 
     outer_shape = residual.shape[:-2]
 

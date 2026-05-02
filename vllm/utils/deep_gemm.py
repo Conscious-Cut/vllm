@@ -140,6 +140,142 @@ _get_mk_alignment_for_contiguous_layout_impl: Callable[..., Any] | None = None
 _transform_sf_into_required_layout_impl: Callable[..., Any] | None = None
 
 
+def _use_sm120_mqa_fallback(q: torch.Tensor) -> bool:
+    return q.is_cuda and current_platform.is_device_capability_family(120)
+
+
+def _sm120_fp8_mqa_logits_fallback(
+    q: torch.Tensor,
+    kv: tuple[torch.Tensor, torch.Tensor],
+    weights: torch.Tensor,
+    cu_seqlen_ks: torch.Tensor,
+    cu_seqlen_ke: torch.Tensor,
+) -> torch.Tensor:
+    """Torch fallback for DeepGEMM FP8 MQA logits on SM120.
+
+    DeepGEMM currently gates the indexing kernels to SM90/SM100.  This path is
+    intentionally scoped to the FP8 indexer-cache format used by DeepSeek V4 on
+    RTX PRO 6000 Blackwell so startup and CUDA graph capture remain functional.
+    """
+    k_fp8, k_scale = kv
+    seq_len, num_heads, _ = q.shape
+    seq_len_kv = k_fp8.shape[0]
+    device = q.device
+    logits = torch.empty(
+        (seq_len, seq_len_kv), dtype=torch.float32, device=device
+    )
+
+    k_fp32 = k_fp8.to(torch.float32)
+    k_scale = k_scale.reshape(-1).to(torch.float32)
+    positions = torch.arange(seq_len_kv, device=device, dtype=cu_seqlen_ks.dtype)
+    chunk_size = 16
+
+    for start in range(0, seq_len, chunk_size):
+        end = min(start + chunk_size, seq_len)
+        q_chunk = q[start:end].to(torch.float32)
+        score = torch.einsum("mhd,nd->hmn", q_chunk, k_fp32)
+        score = score * k_scale.view(1, 1, seq_len_kv)
+        weighted = (
+            score.relu()
+            * weights[start:end].transpose(0, 1).contiguous().unsqueeze(-1)
+        ).sum(dim=0)
+        valid = (positions.unsqueeze(0) >= cu_seqlen_ks[start:end].unsqueeze(1)) & (
+            positions.unsqueeze(0) < cu_seqlen_ke[start:end].unsqueeze(1)
+        )
+        logits[start:end] = weighted.masked_fill(~valid, float("-inf"))
+
+    logger.warning_once(
+        "Using Torch FP8 MQA logits fallback on SM120 because DeepGEMM "
+        "indexing kernels do not support this architecture."
+    )
+    return logits
+
+
+def _sm120_split_paged_fp8_kv_cache(
+    kv_cache: torch.Tensor, head_dim: int
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_blocks, block_size, _, _ = kv_cache.shape
+    block_stride = kv_cache.stride(0)
+    storage_offset = kv_cache.storage_offset()
+
+    value_bytes = torch.as_strided(
+        kv_cache,
+        size=(num_blocks, block_size, head_dim),
+        stride=(block_stride, head_dim, 1),
+        storage_offset=storage_offset,
+    )
+    scale_bytes = torch.as_strided(
+        kv_cache,
+        size=(num_blocks, block_size, 4),
+        stride=(block_stride, 4, 1),
+        storage_offset=storage_offset + block_size * head_dim,
+    )
+    return (
+        value_bytes.view(current_platform.fp8_dtype()),
+        scale_bytes.view(torch.float32).squeeze(-1),
+    )
+
+
+def _sm120_fp8_paged_mqa_logits_fallback(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    context_lens: torch.Tensor,
+    block_tables: torch.Tensor,
+    max_model_len: int,
+) -> torch.Tensor:
+    batch_size, next_n, num_heads, head_dim = q.shape
+    _, block_size, _, _ = kv_cache.shape
+    device = q.device
+    kv_values, kv_scales = _sm120_split_paged_fp8_kv_cache(kv_cache, head_dim)
+
+    context_lens_2d = (
+        context_lens.unsqueeze(-1) if context_lens.dim() == 1 else context_lens
+    )
+    context_lens_2d = context_lens_2d[:batch_size, :next_n].to(torch.int64)
+
+    max_blocks = block_tables.shape[1]
+    safe_block_tables = block_tables[:batch_size].to(torch.int64).clamp(
+        min=0, max=kv_values.shape[0] - 1
+    )
+    gathered_values = kv_values[safe_block_tables].reshape(
+        batch_size, max_blocks * block_size, head_dim
+    )
+    gathered_scales = kv_scales[safe_block_tables].reshape(
+        batch_size, max_blocks * block_size
+    )
+    total_tokens = gathered_values.shape[1]
+    compute_tokens = min(total_tokens, max_model_len)
+
+    gathered_values = gathered_values[:, :compute_tokens].to(torch.float32)
+    gathered_scales = gathered_scales[:, :compute_tokens].to(torch.float32)
+    k = gathered_values * gathered_scales.unsqueeze(-1)
+    q_bhnd = q[:, :next_n].to(torch.float32).permute(0, 2, 1, 3).contiguous()
+    scores = torch.matmul(q_bhnd, k.transpose(1, 2).unsqueeze(1))
+    weights_bhn = weights[: batch_size * next_n].view(batch_size, next_n, num_heads)
+    scores = (
+        scores.relu()
+        * weights_bhn.permute(0, 2, 1).contiguous().unsqueeze(-1)
+    ).sum(dim=1)
+
+    positions = torch.arange(compute_tokens, device=device, dtype=torch.int64)
+    valid = positions.view(1, 1, compute_tokens) < context_lens_2d.unsqueeze(-1)
+    scores = scores.masked_fill(~valid, float("-inf"))
+
+    logits = torch.full(
+        (batch_size * next_n, max_model_len),
+        float("-inf"),
+        dtype=torch.float32,
+        device=device,
+    )
+    logits[:, :compute_tokens] = scores.reshape(batch_size * next_n, compute_tokens)
+    logger.warning_once(
+        "Using Torch FP8 paged MQA logits fallback on SM120 because DeepGEMM "
+        "paged indexing kernels do not support this architecture."
+    )
+    return logits
+
+
 def _import_deep_gemm():
     """Import the deep_gemm module.
 
@@ -370,6 +506,11 @@ def fp8_fp4_mqa_logits(
     Returns:
         Logits tensor of shape [M, N], dtype `torch.float32`.
     """
+    q_values, q_scale = q
+    if q_scale is None and _use_sm120_mqa_fallback(q_values):
+        return _sm120_fp8_mqa_logits_fallback(
+            q_values, kv, weights, cu_seqlen_ks, cu_seqlen_ke
+        )
     _lazy_init()
     if _fp8_fp4_mqa_logits_impl is None:
         return _missing()
@@ -398,6 +539,12 @@ def get_paged_mqa_logits_metadata(
         Backend-specific tensor consumed by `fp8_fp4_paged_mqa_logits` to
         schedule work across SMs.
     """
+    if _use_sm120_mqa_fallback(context_lens):
+        logger.warning_once(
+            "Using empty paged MQA schedule metadata on SM120 because "
+            "DeepGEMM paged indexing kernels do not support this architecture."
+        )
+        return context_lens.new_zeros((num_sms + 1, 2))
     _lazy_init()
     if _get_paged_mqa_logits_metadata_impl is None:
         return _missing()
@@ -442,6 +589,16 @@ def fp8_fp4_paged_mqa_logits(
         Logits tensor of shape [B * next_n, max_model_len], dtype
         `torch.float32`.
     """
+    q_values, q_scale = q
+    if q_scale is None and _use_sm120_mqa_fallback(q_values):
+        return _sm120_fp8_paged_mqa_logits_fallback(
+            q_values,
+            kv_cache,
+            weights,
+            context_lens,
+            block_tables,
+            max_model_len,
+        )
     _lazy_init()
     if _fp8_fp4_paged_mqa_logits_impl is None:
         return _missing()

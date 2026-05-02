@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
-"""Tests for SM100 CUTLASS MXFP4 x MXFP4 grouped MoE kernels."""
+"""Tests for SM100/SM120 CUTLASS MXFP4 x MXFP4 grouped MoE kernels."""
 
 import random
 
@@ -30,9 +30,10 @@ def calc_diff(x, y):
     return 1 - sim
 
 
-def is_sm100_supported() -> bool:
-    return current_platform.is_cuda() and current_platform.is_device_capability_family(
-        100
+def is_sm100_or_sm120_supported() -> bool:
+    return current_platform.is_cuda() and (
+        current_platform.is_device_capability_family(100)
+        or current_platform.is_device_capability_family(120)
     )
 
 
@@ -61,8 +62,8 @@ def compute_ref_output(
 
 
 @pytest.mark.skipif(
-    not is_sm100_supported(),
-    reason="cutlass_mxfp4_group_mm requires CUDA SM100",
+    not is_sm100_or_sm120_supported(),
+    reason="cutlass_mxfp4_group_mm requires CUDA SM100 or SM120",
 )
 @pytest.mark.parametrize("num_experts", [8, 16, 32])
 @pytest.mark.parametrize("out_dtype", [torch.bfloat16])
@@ -201,8 +202,8 @@ def test_cutlass_mxfp4_grouped_mm(num_experts, out_dtype):
 
 
 @pytest.mark.skipif(
-    not is_sm100_supported(),
-    reason="mxfp4_experts_quant requires CUDA SM100",
+    not is_sm100_or_sm120_supported(),
+    reason="mxfp4_experts_quant requires CUDA SM100 or SM120",
 )
 def test_mxfp4_experts_quant_basic():
     """
@@ -242,6 +243,54 @@ def test_mxfp4_experts_quant_basic():
         f"MXFP4 experts quant: output shape={output.shape}, sf shape={output_sf.shape}"
     )
     print("PASSED")
+
+
+@pytest.mark.skipif(
+    not is_sm100_or_sm120_supported(),
+    reason="silu_and_mul_mxfp4_experts_quant requires CUDA SM100 or SM120",
+)
+def test_silu_and_mul_mxfp4_experts_quant_swiglu_limit():
+    device = "cuda"
+    num_experts = 1
+    tokens = 8
+    k = 128
+
+    gate = torch.full((tokens, k), 20.0, device=device, dtype=torch.bfloat16)
+    up = torch.full((tokens, k), 20.0, device=device, dtype=torch.bfloat16)
+    input_tensor = torch.cat([gate, up], dim=1)
+
+    expert_offsets = torch.tensor([0, tokens], device=device, dtype=torch.int32)
+    blockscale_offsets = torch.tensor([0, align(tokens)], device=device,
+                                      dtype=torch.int32)
+
+    unclamped_out, unclamped_sf = ops.silu_and_mul_mxfp4_experts_quant(
+        input_tensor,
+        expert_offsets,
+        blockscale_offsets,
+        num_experts,
+        topk=1,
+    )
+    noop_limit_out, noop_limit_sf = ops.silu_and_mul_mxfp4_experts_quant(
+        input_tensor,
+        expert_offsets,
+        blockscale_offsets,
+        num_experts,
+        topk=1,
+        swiglu_limit=1000.0,
+    )
+    clamped_out, clamped_sf = ops.silu_and_mul_mxfp4_experts_quant(
+        input_tensor,
+        expert_offsets,
+        blockscale_offsets,
+        num_experts,
+        topk=1,
+        swiglu_limit=10.0,
+    )
+
+    assert torch.equal(noop_limit_out, unclamped_out)
+    assert torch.equal(noop_limit_sf, unclamped_sf)
+    assert not torch.equal(clamped_out, unclamped_out) or not torch.equal(
+        clamped_sf, unclamped_sf)
 
 
 if __name__ == "__main__":

@@ -166,7 +166,8 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "silu_and_mul_mxfp4_experts_quant(Tensor! output, Tensor! "
       "output_scale,"
       "Tensor input, Tensor input_offset_by_experts,"
-      "Tensor output_scale_offset_by_experts, int n_experts) -> ()");
+      "Tensor output_scale_offset_by_experts, int n_experts, "
+      "float swiglu_limit) -> ()");
 
   // Fused SiLU+Mul+NVFP4 quantization.
   ops.def(
