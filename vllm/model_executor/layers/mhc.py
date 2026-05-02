@@ -7,6 +7,7 @@ from typing import TYPE_CHECKING
 import torch
 
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.import_utils import has_tilelang
 from vllm.utils.math_utils import cdiv
 from vllm.utils.torch_utils import direct_register_custom_op
@@ -250,6 +251,326 @@ def _mhc_pre_torch_fallback(
     return post_mix, comb_mix, layer_input
 
 
+@triton.jit
+def _mhc_pre_prenorm_mix4_kernel(
+    residual_ptr,
+    fn_ptr,
+    sqrsum_ptr,
+    mixes_ptr,
+    residual_stride_token: tl.constexpr,
+    residual_stride_hc: tl.constexpr,
+    residual_stride_hidden: tl.constexpr,
+    hidden_size: tl.constexpr,
+    hc_hidden_size: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+) -> None:
+    token_idx = tl.program_id(0)
+    mix_idx = tl.program_id(1)
+    offsets = tl.arange(0, BLOCK_K)
+    dot_acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+    sq_acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+
+    for block_start in tl.static_range(0, hc_hidden_size, BLOCK_K):
+        flat_offsets = block_start + offsets
+        hc_offsets = flat_offsets // hidden_size
+        hidden_offsets = flat_offsets - hc_offsets * hidden_size
+        x = tl.load(
+            residual_ptr
+            + token_idx * residual_stride_token
+            + hc_offsets * residual_stride_hc
+            + hidden_offsets * residual_stride_hidden
+        ).to(tl.float32)
+        w = tl.load(fn_ptr + mix_idx * hc_hidden_size + flat_offsets)
+        dot_acc += x * w
+        if mix_idx == 0:
+            sq_acc += x * x
+
+    tl.store(mixes_ptr + token_idx * 24 + mix_idx, tl.sum(dot_acc, axis=0))
+    if mix_idx == 0:
+        tl.store(sqrsum_ptr + token_idx, tl.sum(sq_acc, axis=0))
+
+
+def _mhc_pre_prenorm_mix4_triton(
+    residual_flat: torch.Tensor,
+    fn: torch.Tensor,
+    hidden_size: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    num_tokens = residual_flat.shape[0]
+    mixes = torch.empty(num_tokens, 24, dtype=torch.float32, device=residual_flat.device)
+    sqrsum = torch.empty(num_tokens, dtype=torch.float32, device=residual_flat.device)
+    if num_tokens > 0:
+        block_k = 1024
+        _mhc_pre_prenorm_mix4_kernel[(num_tokens, 24)](
+            residual_flat,
+            fn,
+            sqrsum,
+            mixes,
+            residual_flat.stride(0),
+            residual_flat.stride(1),
+            residual_flat.stride(2),
+            hidden_size,
+            4 * hidden_size,
+            BLOCK_K=block_k,
+            num_warps=8,
+        )
+    return sqrsum, mixes
+
+
+@triton.jit
+def _mhc_pre_mix4_kernel(
+    mixes_ptr,
+    sqrsum_ptr,
+    hc_scale_ptr,
+    hc_base_ptr,
+    pre_mix_ptr,
+    post_mix_ptr,
+    comb_mix_ptr,
+    hc_hidden_size: tl.constexpr,
+    rms_eps: tl.constexpr,
+    hc_pre_eps: tl.constexpr,
+    hc_sinkhorn_eps: tl.constexpr,
+    hc_post_mult_value: tl.constexpr,
+    sinkhorn_repeat: tl.constexpr,
+) -> None:
+    token_idx = tl.program_id(0)
+    offsets = tl.arange(0, 32)
+
+    rms = tl.rsqrt(
+        tl.load(sqrsum_ptr + token_idx) / hc_hidden_size + rms_eps
+    )
+    scale0 = tl.load(hc_scale_ptr + 0)
+    scale1 = tl.load(hc_scale_ptr + 1)
+    scale2 = tl.load(hc_scale_ptr + 2)
+
+    hc_offsets = tl.arange(0, 4)
+    pre = tl.sigmoid(
+        tl.load(mixes_ptr + token_idx * 24 + hc_offsets)
+        * rms
+        * scale0
+        + tl.load(hc_base_ptr + hc_offsets)
+    ) + hc_pre_eps
+    tl.store(pre_mix_ptr + token_idx * 4 + hc_offsets, pre)
+
+    post_offsets = hc_offsets + 4
+    post = tl.sigmoid(
+        tl.load(mixes_ptr + token_idx * 24 + post_offsets)
+        * rms
+        * scale1
+        + tl.load(hc_base_ptr + post_offsets)
+    ) * hc_post_mult_value
+    tl.store(post_mix_ptr + token_idx * 4 + hc_offsets, post)
+
+    comb_mask = offsets < 16
+    cm = tl.load(
+        mixes_ptr + token_idx * 24 + 8 + offsets,
+        mask=comb_mask,
+        other=-float("inf"),
+    ) * rms
+    cm = cm * scale2 + tl.load(
+        hc_base_ptr + 8 + offsets,
+        mask=comb_mask,
+        other=0.0,
+    )
+
+    rows = offsets // 4
+    cols = offsets % 4
+    row_max = tl.full((32,), -float("inf"), dtype=tl.float32)
+    row_sum = tl.zeros((32,), dtype=tl.float32)
+    col_sum = tl.zeros((32,), dtype=tl.float32)
+
+    for r in tl.static_range(0, 4):
+        row_vals = tl.where((rows == r) & comb_mask, cm, -float("inf"))
+        row_max_r = tl.max(row_vals, axis=0)
+        row_max = tl.where(rows == r, row_max_r, row_max)
+    cm = tl.exp(cm - row_max)
+    for r in tl.static_range(0, 4):
+        row_vals = tl.where((rows == r) & comb_mask, cm, 0.0)
+        row_sum_r = tl.sum(row_vals, axis=0)
+        row_sum = tl.where(rows == r, row_sum_r, row_sum)
+    cm = cm / row_sum + hc_sinkhorn_eps
+
+    for c in tl.static_range(0, 4):
+        col_vals = tl.where((cols == c) & comb_mask, cm, 0.0)
+        col_sum_c = tl.sum(col_vals, axis=0)
+        col_sum = tl.where(cols == c, col_sum_c, col_sum)
+    cm = cm / (col_sum + hc_sinkhorn_eps)
+
+    for _ in tl.static_range(0, sinkhorn_repeat - 1):
+        row_sum = tl.zeros((32,), dtype=tl.float32)
+        col_sum = tl.zeros((32,), dtype=tl.float32)
+        for r in tl.static_range(0, 4):
+            row_vals = tl.where((rows == r) & comb_mask, cm, 0.0)
+            row_sum_r = tl.sum(row_vals, axis=0)
+            row_sum = tl.where(rows == r, row_sum_r, row_sum)
+        cm = cm / (row_sum + hc_sinkhorn_eps)
+        for c in tl.static_range(0, 4):
+            col_vals = tl.where((cols == c) & comb_mask, cm, 0.0)
+            col_sum_c = tl.sum(col_vals, axis=0)
+            col_sum = tl.where(cols == c, col_sum_c, col_sum)
+        cm = cm / (col_sum + hc_sinkhorn_eps)
+
+    tl.store(
+        comb_mix_ptr + token_idx * 16 + offsets,
+        cm,
+        mask=comb_mask,
+    )
+
+
+@triton.jit
+def _mhc_pre_apply_mix4_kernel(
+    residual_ptr,
+    pre_mix_ptr,
+    layer_input_ptr,
+    residual_stride_token: tl.constexpr,
+    residual_stride_hc: tl.constexpr,
+    residual_stride_hidden: tl.constexpr,
+    hidden_size: tl.constexpr,
+    BLOCK_H: tl.constexpr,
+) -> None:
+    token_idx = tl.program_id(0)
+    block_idx = tl.program_id(1)
+    offsets = block_idx * BLOCK_H + tl.arange(0, BLOCK_H)
+    mask = offsets < hidden_size
+
+    pre0 = tl.load(pre_mix_ptr + token_idx * 4 + 0)
+    pre1 = tl.load(pre_mix_ptr + token_idx * 4 + 1)
+    pre2 = tl.load(pre_mix_ptr + token_idx * 4 + 2)
+    pre3 = tl.load(pre_mix_ptr + token_idx * 4 + 3)
+    base = residual_ptr + token_idx * residual_stride_token
+    x0 = tl.load(
+        base + 0 * residual_stride_hc + offsets * residual_stride_hidden,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    x1 = tl.load(
+        base + 1 * residual_stride_hc + offsets * residual_stride_hidden,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    x2 = tl.load(
+        base + 2 * residual_stride_hc + offsets * residual_stride_hidden,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    x3 = tl.load(
+        base + 3 * residual_stride_hc + offsets * residual_stride_hidden,
+        mask=mask,
+        other=0.0,
+    ).to(tl.float32)
+    out = pre0 * x0 + pre1 * x1 + pre2 * x2 + pre3 * x3
+    tl.store(layer_input_ptr + token_idx * hidden_size + offsets, out, mask=mask)
+
+
+def _mhc_pre_sm120_triton_fallback(
+    residual: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_pre_eps: float,
+    hc_sinkhorn_eps: float,
+    hc_post_mult_value: float,
+    sinkhorn_repeat: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+    hc_mult = residual.shape[-2]
+    hidden_size = residual.shape[-1]
+    if not (
+        residual.is_cuda
+        and residual.dtype == torch.bfloat16
+        and fn.dtype == torch.float32
+        and hc_scale.dtype == torch.float32
+        and hc_base.dtype == torch.float32
+        and hc_mult == 4
+        and hidden_size % 128 == 0
+        and fn.shape == (24, 4 * hidden_size)
+        and hc_scale.shape == (3,)
+        and hc_base.shape == (24,)
+        and sinkhorn_repeat >= 1
+    ):
+        return None
+
+    outer_shape = residual.shape[:-2]
+    residual_flat = residual.reshape(-1, hc_mult, hidden_size)
+    num_tokens = residual_flat.shape[0]
+    hc_hidden_size = hc_mult * hidden_size
+
+    if num_tokens <= 16:
+        sqrsum, mixes = _mhc_pre_prenorm_mix4_triton(
+            residual_flat,
+            fn,
+            hidden_size,
+        )
+    else:
+        residual_flat_float = residual_flat.reshape(num_tokens, hc_hidden_size).float()
+        sqrsum = residual_flat_float.square().sum(dim=-1)
+        mixes = torch.mm(residual_flat_float, fn.t())
+
+    pre_mix = torch.empty(
+        num_tokens,
+        hc_mult,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    post_mix = torch.empty(
+        num_tokens,
+        hc_mult,
+        1,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    comb_mix = torch.empty(
+        num_tokens,
+        hc_mult,
+        hc_mult,
+        dtype=torch.float32,
+        device=residual.device,
+    )
+    layer_input = torch.empty(
+        num_tokens,
+        hidden_size,
+        dtype=torch.bfloat16,
+        device=residual.device,
+    )
+
+    if num_tokens > 0:
+        _mhc_pre_mix4_kernel[(num_tokens,)](
+            mixes,
+            sqrsum,
+            hc_scale,
+            hc_base,
+            pre_mix,
+            post_mix,
+            comb_mix,
+            hc_hidden_size,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+            num_warps=1,
+        )
+        block_h = 256
+        _mhc_pre_apply_mix4_kernel[
+            (num_tokens, triton.cdiv(hidden_size, block_h))
+        ](
+            residual_flat,
+            pre_mix,
+            layer_input,
+            residual_flat.stride(0),
+            residual_flat.stride(1),
+            residual_flat.stride(2),
+            hidden_size,
+            BLOCK_H=block_h,
+            num_warps=8,
+        )
+
+    return (
+        post_mix.view(*outer_shape, hc_mult, 1),
+        comb_mix.view(*outer_shape, hc_mult, hc_mult),
+        layer_input.view(*outer_shape, hidden_size),
+    )
+
+
 def mhc_pre(
     residual: torch.Tensor,
     fn: torch.Tensor,
@@ -301,6 +622,19 @@ def mhc_pre(
     assert hc_base.shape == (hc_mult3,)
 
     if _use_torch_mhc_pre_fallback(residual):
+        sm120_result = _mhc_pre_sm120_triton_fallback(
+            residual,
+            fn,
+            hc_scale,
+            hc_base,
+            rms_eps,
+            hc_pre_eps,
+            hc_sinkhorn_eps,
+            hc_post_mult_value,
+            sinkhorn_repeat,
+        )
+        if sm120_result is not None:
+            return sm120_result
         return _mhc_pre_torch_fallback(
             residual,
             fn,

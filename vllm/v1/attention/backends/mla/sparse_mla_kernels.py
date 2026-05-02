@@ -312,6 +312,134 @@ def build_combined_sparse_mla_decode_valid_mask(
     )
 
 
+@triton.jit
+def _materialized_score_value_attention_with_sink_kernel(
+    scores_ptr,
+    kv_ptr,
+    valid_ptr,
+    sink_ptr,
+    output_ptr,
+    stride_scores_t: tl.constexpr,
+    stride_scores_h: tl.constexpr,
+    stride_scores_k: tl.constexpr,
+    stride_kv_t: tl.constexpr,
+    stride_kv_k: tl.constexpr,
+    stride_kv_d: tl.constexpr,
+    stride_valid_t: tl.constexpr,
+    stride_valid_k: tl.constexpr,
+    stride_output_t: tl.constexpr,
+    stride_output_h: tl.constexpr,
+    stride_output_d: tl.constexpr,
+    num_heads: tl.constexpr,
+    num_candidates: tl.constexpr,
+    head_dim: tl.constexpr,
+    BLOCK_K: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    token_head = tl.program_id(0)
+    dim_block = tl.program_id(1)
+    token_idx = token_head // num_heads
+    head_idx = token_head - token_idx * num_heads
+
+    candidate_offsets = tl.arange(0, BLOCK_K)
+    dim_offsets = dim_block * BLOCK_D + tl.arange(0, BLOCK_D)
+    candidate_mask = candidate_offsets < num_candidates
+    dim_mask = dim_offsets < head_dim
+
+    scores = tl.load(
+        scores_ptr
+        + token_idx * stride_scores_t
+        + head_idx * stride_scores_h
+        + candidate_offsets * stride_scores_k,
+        mask=candidate_mask,
+        other=-float("inf"),
+    ).to(tl.float32)
+    valid = tl.load(
+        valid_ptr + token_idx * stride_valid_t + candidate_offsets * stride_valid_k,
+        mask=candidate_mask,
+        other=0,
+    )
+    scores = tl.where(valid & candidate_mask, scores, -float("inf"))
+    sink = tl.load(sink_ptr + head_idx).to(tl.float32)
+    max_score = tl.maximum(tl.max(scores, axis=0), sink)
+    weights = tl.exp(scores - max_score)
+    weights = tl.where(valid & candidate_mask, weights, 0.0)
+    denom = tl.sum(weights, axis=0) + tl.exp(sink - max_score)
+
+    kv = tl.load(
+        kv_ptr
+        + token_idx * stride_kv_t
+        + candidate_offsets[:, None] * stride_kv_k
+        + dim_offsets[None, :] * stride_kv_d,
+        mask=candidate_mask[:, None] & dim_mask[None, :],
+        other=0.0,
+    ).to(tl.float32)
+    output = tl.sum(weights[:, None] * kv, axis=0) / denom
+    tl.store(
+        output_ptr
+        + token_idx * stride_output_t
+        + head_idx * stride_output_h
+        + dim_offsets * stride_output_d,
+        output,
+        mask=dim_mask,
+    )
+
+
+def _matmul_sparse_mla_attention_with_sink_small_decode(
+    q: torch.Tensor,
+    kv: torch.Tensor,
+    valid_tokens: torch.Tensor,
+    scale: float,
+    attn_sink: torch.Tensor,
+    output: torch.Tensor,
+    active_heads: int,
+) -> bool:
+    if not (
+        q.shape[0] <= 4
+        and q.shape[-1] == 512
+        and kv.shape[-1] == 512
+        and kv.shape[1] <= 1024
+        and active_heads <= q.shape[1]
+    ):
+        return False
+
+    q_active = q[:, :active_heads]
+    if q_active.dtype != kv.dtype:
+        q_active = q_active.to(kv.dtype)
+
+    scores = torch.bmm(q_active, kv.transpose(1, 2)).float()
+    scores.mul_(scale)
+    block_d = 32
+    grid = (q.shape[0] * active_heads, triton.cdiv(q.shape[-1], block_d))
+    _materialized_score_value_attention_with_sink_kernel[grid](
+        scores,
+        kv,
+        valid_tokens,
+        attn_sink,
+        output,
+        scores.stride(0),
+        scores.stride(1),
+        scores.stride(2),
+        kv.stride(0),
+        kv.stride(1),
+        kv.stride(2),
+        valid_tokens.stride(0),
+        valid_tokens.stride(1),
+        output.stride(0),
+        output.stride(1),
+        output.stride(2),
+        active_heads,
+        kv.shape[1],
+        q.shape[-1],
+        BLOCK_K=triton.next_power_of_2(kv.shape[1]),
+        BLOCK_D=block_d,
+        num_warps=8,
+    )
+    if output.shape[1] > active_heads:
+        output[:, active_heads:].zero_()
+    return True
+
+
 def matmul_sparse_mla_attention_with_sink(
     q: torch.Tensor,
     kv: torch.Tensor,
@@ -346,6 +474,17 @@ def matmul_sparse_mla_attention_with_sink(
     assert active_heads <= q.shape[1]
     assert active_heads <= output.shape[1]
     assert active_heads <= attn_sink.shape[0]
+
+    if _matmul_sparse_mla_attention_with_sink_small_decode(
+        q,
+        kv,
+        valid_tokens,
+        scale,
+        attn_sink,
+        output,
+        active_heads,
+    ):
+        return
 
     q_active = q[:, :active_heads]
     if q_active.dtype != kv.dtype:

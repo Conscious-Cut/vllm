@@ -70,6 +70,18 @@ def fused_add_rms_norm(
     return x, residual
 
 
+def rms_norm_cuda(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    variance_epsilon: float,
+) -> torch.Tensor:
+    from vllm import _custom_ops as ops
+
+    out = torch.empty_like(x)
+    ops.rms_norm(out, x, weight, variance_epsilon)
+    return out
+
+
 def poly_norm(
     x: torch.Tensor, weight: torch.Tensor, bias: torch.Tensor, variance_epsilon: float
 ) -> torch.Tensor:
@@ -261,6 +273,13 @@ class RMSNorm(CustomOp):
         residual: torch.Tensor | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if residual is None and not envs.VLLM_BATCH_INVARIANT:
+            if (
+                self.has_weight
+                and self.variance_size_override is None
+                and self.weight.data.device == x.device
+                and current_platform.is_device_capability_family(120)
+            ):
+                return rms_norm_cuda(x, self.weight.data, self.variance_epsilon)
             return ir.ops.rms_norm(
                 x, self.weight.data, self.variance_epsilon, self.variance_size_override
             )
