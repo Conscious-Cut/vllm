@@ -91,6 +91,9 @@ class RMSNorm(CustomOp):
         native_add_rms_norm = priority.fused_add_rms_norm[0] == "native" or var_override
         self.pass_weight = self.has_weight or not native_rms_norm
         self.pass_weight_add = self.has_weight or not native_add_rms_norm
+        self.use_sm120_rms_norm_cuda = current_platform.is_device_capability_family(
+            120
+        )
 
     def forward_native(
         self,
@@ -124,7 +127,7 @@ class RMSNorm(CustomOp):
                 self.has_weight
                 and self.variance_size_override is None
                 and self.weight.data.device == x.device
-                and current_platform.is_device_capability_family(120)
+                and self.use_sm120_rms_norm_cuda
             ):
                 return rms_norm_cuda(x, self.weight.data, self.variance_epsilon)
             return ir.ops.rms_norm(
