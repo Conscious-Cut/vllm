@@ -46,6 +46,29 @@ static constexpr int MXFP4_SF_VEC_SIZE = 32;
 static constexpr int MXFP4_NUM_THREADS_PER_SF =
     MXFP4_SF_VEC_SIZE / CVT_FP4_ELTS_PER_THREAD;
 
+template <class Type>
+__inline__ __device__ PackedVec<Type, CVT_FP4_PACK16>
+compute_silu_mul_clamped(const PackedVec<Type, CVT_FP4_PACK16>& gate_vec,
+                         const PackedVec<Type, CVT_FP4_PACK16>& up_vec,
+                         float limit) {
+  PackedVec<Type, CVT_FP4_PACK16> result;
+
+#pragma unroll
+  for (int i = 0; i < CVT_FP4_ELTS_PER_THREAD / 2; ++i) {
+    using packed_t = typename PackedTypeConverter<Type>::Type;
+    float2 gate = cast_to_float2(gate_vec.elts[i]);
+    float2 up = cast_to_float2(up_vec.elts[i]);
+    gate.x = fminf(gate.x, limit);
+    gate.y = fminf(gate.y, limit);
+    up.x = fminf(fmaxf(up.x, -limit), limit);
+    up.y = fminf(fmaxf(up.y, -limit), limit);
+    float2 silu_vec = silu2(gate);
+    result.elts[i] = cast_to_packed<packed_t>(
+        make_float2(silu_vec.x * up.x, silu_vec.y * up.y));
+  }
+  return result;
+}
+
 // MXFP4 quantization kernel for experts.
 // Uses 32-element blocks with E8M0 (UE8M0) scale factors.
 // When FUSE_SILU_MUL=true, expects input with gate||up layout and fuses
@@ -57,7 +80,8 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
                           fp4_packed_t* out, uint32_t* SFout,
                           uint32_t* input_offset_by_experts,
                           uint32_t* output_scale_offset_by_experts,
-                          int n_experts, bool low_latency) {
+                          int n_experts, float swiglu_limit,
+                          bool low_latency) {
   using PackedVec = PackedVec<Type, CVT_FP4_PACK16>;
   static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
                 "Vec size is not matched.");
@@ -122,7 +146,10 @@ __global__ void __launch_bounds__(512, VLLM_BLOCKS_PER_SM(512))
     if constexpr (FUSE_SILU_MUL) {
       PackedVec in_vec_up =
           reinterpret_cast<PackedVec const*>(in)[inOffset + colsPerRow];
-      quant_input = compute_silu_mul(in_vec, in_vec_up);
+      quant_input = swiglu_limit > 0.0f
+                        ? compute_silu_mul_clamped(in_vec, in_vec_up,
+                                                   swiglu_limit)
+                        : compute_silu_mul(in_vec, in_vec_up);
     } else {
       quant_input = in_vec;
     }
@@ -156,7 +183,7 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
                           fp4_packed_t* out, uint32_t* SFout,
                           uint32_t* input_offset_by_experts,
                           uint32_t* output_scale_offset_by_experts,
-                          int n_experts) {
+                          int n_experts, float swiglu_limit) {
   using PackedVec = PackedVec<Type, CVT_FP4_PACK16>;
   static_assert(sizeof(PackedVec) == sizeof(Type) * CVT_FP4_ELTS_PER_THREAD,
                 "Vec size is not matched.");
@@ -218,7 +245,10 @@ __global__ void __launch_bounds__(1024, VLLM_BLOCKS_PER_SM(1024))
     if constexpr (FUSE_SILU_MUL) {
       PackedVec in_vec_up =
           reinterpret_cast<PackedVec const*>(in)[inOffset + colsPerRow];
-      quant_input = compute_silu_mul(in_vec, in_vec_up);
+      quant_input = swiglu_limit > 0.0f
+                        ? compute_silu_mul_clamped(in_vec, in_vec_up,
+                                                   swiglu_limit)
+                        : compute_silu_mul(in_vec, in_vec_up);
     } else {
       quant_input = in_vec;
     }
@@ -246,7 +276,8 @@ template <typename T, bool FUSE_SILU_MUL = false>
 void mxfp4_quant_impl(void* output, void* output_scale, void* input,
                       void* input_offset_by_experts,
                       void* output_scale_offset_by_experts, int m_topk, int k,
-                      int n_experts, cudaStream_t stream) {
+                      int n_experts, cudaStream_t stream,
+                      float swiglu_limit = 0.0f) {
   int multiProcessorCount =
       get_device_attribute(cudaDevAttrMultiProcessorCount, -1);
 
@@ -274,7 +305,7 @@ void mxfp4_quant_impl(void* output, void* output_scale, void* input,
               reinterpret_cast<uint32_t*>(output_scale),
               reinterpret_cast<uint32_t*>(input_offset_by_experts),
               reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
-              n_experts);
+              n_experts, swiglu_limit);
     } else {
       mxfp4_cvt_fp16_to_fp4<T, FUSE_SILU_MUL, true>
           <<<grid, block, shared_mem_size, stream>>>(
@@ -283,7 +314,7 @@ void mxfp4_quant_impl(void* output, void* output_scale, void* input,
               reinterpret_cast<uint32_t*>(output_scale),
               reinterpret_cast<uint32_t*>(input_offset_by_experts),
               reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
-              n_experts);
+              n_experts, swiglu_limit);
     }
   } else {
     if (n_experts >= 16) {
@@ -294,7 +325,7 @@ void mxfp4_quant_impl(void* output, void* output_scale, void* input,
               reinterpret_cast<uint32_t*>(output_scale),
               reinterpret_cast<uint32_t*>(input_offset_by_experts),
               reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
-              n_experts, /* bool low_latency */ true);
+              n_experts, swiglu_limit, /* bool low_latency */ true);
     } else {
       mxfp4_cvt_fp16_to_fp4<T, FUSE_SILU_MUL, true><<<grid, block, 0, stream>>>(
           m_topk, k, reinterpret_cast<T*>(input),
@@ -302,7 +333,7 @@ void mxfp4_quant_impl(void* output, void* output_scale, void* input,
           reinterpret_cast<uint32_t*>(output_scale),
           reinterpret_cast<uint32_t*>(input_offset_by_experts),
           reinterpret_cast<uint32_t*>(output_scale_offset_by_experts),
-          n_experts, /* bool low_latency */ true);
+          n_experts, swiglu_limit, /* bool low_latency */ true);
     }
   }
 }
@@ -397,7 +428,7 @@ void silu_and_mul_mxfp4_experts_quant(
     torch::stable::Tensor const& input,
     torch::stable::Tensor const& input_offset_by_experts,
     torch::stable::Tensor const& output_scale_offset_by_experts,
-    int64_t n_experts) {
+    int64_t n_experts, double swiglu_limit) {
   auto m_topk = input.size(0);
   auto k_times_2 = input.size(1);
   STD_TORCH_CHECK(k_times_2 % 2 == 0, "input width must be even (gate || up)");
@@ -418,7 +449,7 @@ void silu_and_mul_mxfp4_experts_quant(
             output.data_ptr(), output_scale.data_ptr(), input.data_ptr(),
             input_offset_by_experts.data_ptr(),
             output_scale_offset_by_experts.data_ptr(), m_topk, k, n_experts,
-            stream);
+            stream, static_cast<float>(swiglu_limit));
       });
 }
 

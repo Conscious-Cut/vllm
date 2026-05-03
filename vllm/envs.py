@@ -63,6 +63,14 @@ if TYPE_CHECKING:
     VLLM_USE_RAY_V2_EXECUTOR_BACKEND: bool = False
     VLLM_XLA_USE_SPMD: bool = False
     VLLM_WORKER_MULTIPROC_METHOD: Literal["fork", "spawn"] = "fork"
+    VLLM_TRITON_MLA_SPARSE: bool | None = None
+    VLLM_TRITON_MLA_SPARSE_DUMP: bool = False
+    VLLM_TRITON_MLA_SPARSE_DUMP_PATH: str | None = None
+    VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE: int = 512
+    VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE: int = 256
+    VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH: bool = True
+    VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE: int | None = None
+    VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE: bool = True
     VLLM_ASSETS_CACHE: str = os.path.join(VLLM_CACHE_ROOT, "assets")
     VLLM_ASSETS_CACHE_MODEL_CLEAN: bool = False
     VLLM_IMAGE_FETCH_TIMEOUT: int = 5
@@ -900,6 +908,34 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Default: 512 MB
     "VLLM_SPARSE_INDEXER_MAX_LOGITS_MB": lambda: int(
         os.getenv("VLLM_SPARSE_INDEXER_MAX_LOGITS_MB", "512")
+    ),
+    "VLLM_TRITON_MLA_SPARSE": lambda: (
+        bool(int(os.environ["VLLM_TRITON_MLA_SPARSE"]))
+        if "VLLM_TRITON_MLA_SPARSE" in os.environ
+        else None
+    ),
+    "VLLM_TRITON_MLA_SPARSE_DUMP": lambda: bool(
+        int(os.getenv("VLLM_TRITON_MLA_SPARSE_DUMP", "0"))
+    ),
+    "VLLM_TRITON_MLA_SPARSE_DUMP_PATH": lambda: os.getenv(
+        "VLLM_TRITON_MLA_SPARSE_DUMP_PATH"
+    ),
+    "VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_TOPK_CHUNK_SIZE", "512")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_QUERY_CHUNK_SIZE", "256")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH": lambda: bool(
+        int(os.getenv("VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH", "1"))
+    ),
+    "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE": lambda: (
+        int(os.environ["VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE"])
+        if "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE" in os.environ
+        else None
+    ),
+    "VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE": lambda: bool(
+        int(os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE", "1"))
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests

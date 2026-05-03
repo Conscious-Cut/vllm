@@ -815,6 +815,7 @@ def run_cutlass_moe_mxfp4(
     e: int,
     device: torch.device,
     apply_router_weight_on_input: bool = False,
+    swiglu_limit: float | None = None,
 ) -> None:
     """MXFP4 x MXFP4 MoE implementation using CUTLASS grouped GEMM."""
     is_gated = activation.is_gated
@@ -898,7 +899,12 @@ def run_cutlass_moe_mxfp4(
     del rep_a_fp4, rep_a_blockscale
     if activation == MoEActivation.SILU:
         int_fp4, int_blockscale = ops.silu_and_mul_mxfp4_experts_quant(
-            c1, expert_offsets, blockscale_offsets, e, num_topk
+            c1,
+            expert_offsets,
+            blockscale_offsets,
+            e,
+            num_topk,
+            swiglu_limit=swiglu_limit,
         )
     else:
         apply_moe_activation(activation, c2, c1)
@@ -988,7 +994,9 @@ class CutlassExpertsMxfp4(mk.FusedMoEExpertsModular):
     @staticmethod
     def _supports_current_device() -> bool:
         p = current_platform
-        return p.is_cuda() and p.is_device_capability_family(100)
+        return p.is_cuda() and (
+            p.is_device_capability_family(100) or p.is_device_capability_family(120)
+        )
 
     @staticmethod
     def _supports_no_act_and_mul() -> bool:
@@ -1087,6 +1095,7 @@ class CutlassExpertsMxfp4(mk.FusedMoEExpertsModular):
             e=e,
             device=hidden_states.device,
             apply_router_weight_on_input=apply_router_weight_on_input,
+            swiglu_limit=self.quant_config.gemm1_clamp_limit,
         )
 
 

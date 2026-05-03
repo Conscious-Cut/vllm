@@ -18,6 +18,8 @@ from vllm.model_executor.layers.fused_moe.all2all_utils import (
 from vllm.model_executor.layers.fused_moe.config import (
     FusedMoEQuantConfig,
     FusedMoEQuantDesc,
+    RoutingMethodType,
+    mxfp4_moe_quant_config,
     mxfp4_mxfp8_moe_quant_config,
     mxfp4_w4a16_moe_quant_config,
     ocp_mx_moe_quant_config,
@@ -26,6 +28,7 @@ from vllm.model_executor.layers.quantization.utils.mxfp4_utils import _swizzle_m
 from vllm.model_executor.layers.quantization.utils.quant_utils import (
     QuantKey,
     kFp8Dynamic128Sym,
+    kMxfp4Dynamic,
     kMxfp4Static,
     kMxfp8Dynamic,
 )
@@ -56,6 +59,8 @@ class Mxfp4MoeBackend(Enum):
     # FlashInfer CUTLASS backends
     FLASHINFER_CUTLASS_MXFP4_MXFP8 = "FLASHINFER_CUTLASS_MXFP4_MXFP8"
     FLASHINFER_CUTLASS_MXFP4_BF16 = "FLASHINFER_CUTLASS_MXFP4_BF16"
+    # Native vLLM CUTLASS MXFP4 x MXFP4 backend
+    CUTLASS_MXFP4 = "CUTLASS_MXFP4"
     # Marlin
     BATCHED_MARLIN = "BATCHED_MARLIN"
     MARLIN = "MARLIN"
@@ -115,6 +120,13 @@ def backend_to_kernel_cls(
         )
 
         return [FlashInferExperts]
+
+    elif backend == Mxfp4MoeBackend.CUTLASS_MXFP4:
+        from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
+            CutlassExpertsMxfp4,
+        )
+
+        return [CutlassExpertsMxfp4]
 
     elif backend == Mxfp4MoeBackend.TRITON:
         from vllm.model_executor.layers.fused_moe.experts.gpt_oss_triton_kernels_moe import (  # noqa: E501
@@ -190,6 +202,7 @@ def map_mxfp4_backend(runner_backend: MoEBackend) -> Mxfp4MoeBackend:
         "flashinfer_trtllm_afp8": Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
         "flashinfer_cutlass": Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         "flashinfer_cutlass_afp8": Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
+        "cutlass": Mxfp4MoeBackend.CUTLASS_MXFP4,
         "triton": Mxfp4MoeBackend.TRITON,
         "triton_unfused": Mxfp4MoeBackend.TRITON_UNFUSED,
         "humming": Mxfp4MoeBackend.HUMMING,
@@ -236,6 +249,7 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
     _AVAILABLE_BACKENDS = [
         Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
         Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+        Mxfp4MoeBackend.CUTLASS_MXFP4,
         # TRITON_UNFUSED has bug with MTP support
         # TODO re-enable after kernel is fixed
         # TRITON_UNFUSED
@@ -243,6 +257,24 @@ def _get_priority_backends() -> list[Mxfp4MoeBackend]:
         Mxfp4MoeBackend.BATCHED_MARLIN,
     ]
     return _AVAILABLE_BACKENDS
+
+
+def _get_priority_backends_for_config(
+    config: FusedMoEConfig,
+) -> list[Mxfp4MoeBackend]:
+    if (
+        current_platform.is_device_capability(120)
+        and config.routing_method == RoutingMethodType.DeepseekV4
+        and not config.has_bias
+    ):
+        return [
+            Mxfp4MoeBackend.FLASHINFER_TRTLLM_MXFP4_MXFP8,
+            Mxfp4MoeBackend.DEEPGEMM_MXFP4,
+            Mxfp4MoeBackend.MARLIN,
+            Mxfp4MoeBackend.CUTLASS_MXFP4,
+            Mxfp4MoeBackend.BATCHED_MARLIN,
+        ]
+    return _get_priority_backends()
 
 
 def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
@@ -254,6 +286,8 @@ def _backend_activation_key(backend: Mxfp4MoeBackend) -> QuantKey | None:
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
     ):
         return kMxfp8Dynamic
+    if backend == Mxfp4MoeBackend.CUTLASS_MXFP4:
+        return kMxfp4Dynamic
     return None
 
 
@@ -314,6 +348,10 @@ def select_gpt_oss_mxfp4_moe_backend(
         activation_key: QuantKey | None,
         activation_format: mk.FusedMoEActivationFormat,
     ) -> tuple[Mxfp4MoeBackend, type[mk.FusedMoEExperts]]:
+        if backend == Mxfp4MoeBackend.CUTLASS_MXFP4 and config.has_bias:
+            raise ValueError(
+                _make_log_unsupported(backend, "kernel does not support bias")
+            )
         reason: str | None = None
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(
@@ -501,7 +539,13 @@ def select_mxfp4_moe_backend(
         )
 
     # Iterate priority backends: TRTLLM MXFP8, then Triton.
-    for backend in _get_priority_backends():
+    for backend in _get_priority_backends_for_config(config):
+        if backend == Mxfp4MoeBackend.CUTLASS_MXFP4 and config.has_bias:
+            logger.debug_once(
+                _make_log_unsupported(backend, "kernel does not support bias"),
+                scope="local",
+            )
+            continue
         activation_key = _backend_activation_key(backend)
         for k_cls in backend_to_kernel_cls(backend):
             supported, reason = k_cls.is_supported_config(
@@ -536,6 +580,7 @@ def mxfp4_round_up_hidden_size_and_intermediate_size(
         intermediate_size = round_up(intermediate_size, 256)
         hidden_size = round_up(hidden_size, 256)
     elif backend in (
+        Mxfp4MoeBackend.CUTLASS_MXFP4,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_BF16,
         Mxfp4MoeBackend.FLASHINFER_CUTLASS_MXFP4_MXFP8,
     ):
@@ -1036,6 +1081,32 @@ def convert_weight_to_mxfp4_moe_kernel_format(
 
     sf_block_size = 32  # mxfp4 block size
 
+    if mxfp4_backend == Mxfp4MoeBackend.CUTLASS_MXFP4:
+        from vllm.model_executor.layers.fused_moe.experts.cutlass_moe import (
+            swizzle_mxfp4_scales,
+        )
+
+        def _swizzle_expert_scales(scales: torch.Tensor) -> torch.Tensor:
+            e, n, scale_k = scales.shape
+            k = scale_k * sf_block_size
+            return torch.stack(
+                [
+                    swizzle_mxfp4_scales(scales[i].to(torch.uint8), n, k).reshape(
+                        n, scale_k
+                    )
+                    for i in range(e)
+                ]
+            )
+
+        return (
+            w13_weight.data,
+            w2_weight.data,
+            _swizzle_expert_scales(w13_weight_scale.data),
+            _swizzle_expert_scales(w2_weight_scale.data),
+            w13_bias,
+            w2_bias,
+        )
+
     if mxfp4_backend in TRTLLM_BACKENDS:
         assert _cache_permute_indices is not None
         from flashinfer.fp4_quantization import nvfp4_block_scale_interleave
@@ -1256,6 +1327,14 @@ def make_mxfp4_moe_quant_config(
         return mxfp4_mxfp8_moe_quant_config(
             w1_bias=w1_bias,
             w2_bias=w2_bias,
+            w1_scale=w1_scale,
+            w2_scale=w2_scale,
+            gemm1_alpha=gemm1_alpha,
+            gemm1_beta=gemm1_beta,
+            gemm1_clamp_limit=swiglu_limit,
+        )
+    elif mxfp4_backend == Mxfp4MoeBackend.CUTLASS_MXFP4:
+        return mxfp4_moe_quant_config(
             w1_scale=w1_scale,
             w2_scale=w2_scale,
             gemm1_alpha=gemm1_alpha,

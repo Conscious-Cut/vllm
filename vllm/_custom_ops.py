@@ -1960,6 +1960,7 @@ def silu_and_mul_mxfp4_experts_quant(
     blockscale_offsets: torch.Tensor,
     n_experts: int,
     topk: int,
+    swiglu_limit: float | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """
     Fused SiLU+Mul+MXFP4 quantization for MoE intermediate activations.
@@ -1993,6 +1994,7 @@ def silu_and_mul_mxfp4_experts_quant(
         expert_offsets,
         blockscale_offsets,
         n_experts,
+        float(swiglu_limit or 0.0),
     )
     output_scales = output_scales.view(torch.uint8)
     return output, output_scales

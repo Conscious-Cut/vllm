@@ -934,6 +934,20 @@ class VllmConfig:
             if "-quant_fp8" not in custom_ops:
                 custom_ops.append("+quant_fp8")
 
+        model_type = None
+        if self.model_config is not None:
+            model_type = getattr(self.model_config.hf_text_config, "model_type", None)
+        if model_type == "deepseek_v4":
+            if (
+                current_platform.is_cuda()
+                and current_platform.is_device_capability_family(120)
+            ):
+                # Native RMSNorm lowers to several small reductions on SM120
+                # DSV4 decode; the CUDA custom op is faster for this path.
+                custom_ops = self.compilation_config.custom_ops
+                if "-rms_norm" not in custom_ops and "+rms_norm" not in custom_ops:
+                    custom_ops.append("+rms_norm")
+
         current_platform.apply_config_platform_defaults(self)
 
         if self.compilation_config.mode is None:
