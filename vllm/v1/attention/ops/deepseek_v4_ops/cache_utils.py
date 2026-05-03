@@ -287,8 +287,7 @@ def _dequantize_and_gather_k_kernel(
                 # Dequantize: bf16_value = fp8_value * scale
                 x_dequant = x_float * scale
 
-                # Store as bf16
-                tl.store(output_row_ptr + offsets, x_dequant.to(tl.bfloat16), mask=mask)
+                tl.store(output_row_ptr + offsets, x_dequant, mask=mask)
 
         # ========== Copy BF16 portion directly ==========
         bf16_output_offset = fp8_dim  # After 448 elements in output
@@ -382,7 +381,7 @@ def _dequantize_global_slots_k_kernel(
     if slot_id < 0:
         tl.store(
             output_row + offsets,
-            tl.zeros((BLOCK_D,), dtype=tl.float32).to(tl.bfloat16),
+            tl.zeros((BLOCK_D,), dtype=tl.float32),
             mask=offsets < output_dim,
         )
         return
@@ -405,7 +404,7 @@ def _dequantize_global_slots_k_kernel(
     encoded_scale = tl.load(token_scale_ptr + scale_offsets, mask=fp8_mask, other=127)
     scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
     x_dequant = x_float * scale
-    tl.store(output_row + fp8_offsets, x_dequant.to(tl.bfloat16), mask=fp8_mask)
+    tl.store(output_row + fp8_offsets, x_dequant, mask=fp8_mask)
 
     bf16_offsets = tl.arange(0, 64)
     bf16_cache_ptr = (token_data_ptr + fp8_dim).to(tl.pointer_type(tl.bfloat16))
@@ -432,7 +431,7 @@ def dequantize_global_slots_k_cache(
     )
     assert out.shape[:2] == slot_ids.shape
     assert out.shape[-1] == 512
-    assert out.dtype == torch.bfloat16
+    assert out.dtype in (torch.bfloat16, torch.float32)
     assert k_cache.dtype == torch.uint8
 
     TOKEN_FP8_DIM = 448
@@ -477,7 +476,7 @@ def dequantize_combined_sparse_mla_decode_kv(
     compressed_topk = compressed_slot_ids.shape[-1]
     assert combined_kv.shape[0] == compressed_slot_ids.shape[0]
     assert combined_kv.shape[-1] == 512
-    assert combined_kv.dtype == torch.bfloat16
+    assert combined_kv.dtype in (torch.bfloat16, torch.float32)
     assert combined_kv.shape[1] >= compressed_topk
 
     dequantize_global_slots_k_cache(

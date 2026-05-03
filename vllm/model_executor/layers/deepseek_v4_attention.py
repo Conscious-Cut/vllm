@@ -1181,7 +1181,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             ) = current_workspace_manager().get_simultaneous(
                 (
                     (num_decode_tokens, total_candidates, q.shape[-1]),
-                    torch.bfloat16,
+                    torch.float32,
                 ),
                 ((num_decode_tokens, total_candidates), torch.bool),
             )

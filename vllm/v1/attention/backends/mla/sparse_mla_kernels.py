@@ -394,6 +394,11 @@ def _matmul_sparse_mla_attention_with_sink_small_decode(
     output: torch.Tensor,
     active_heads: int,
 ) -> bool:
+    # The custom tiny-decode softmax/value kernel is faster, but currently
+    # produces unstable DeepSeek V4 generations on SM120. Keep the materialized
+    # decode path on the numerically correct PyTorch implementation below.
+    return False
+
     if not (
         q.shape[0] <= 4
         and q.shape[-1] == 512
@@ -404,10 +409,10 @@ def _matmul_sparse_mla_attention_with_sink_small_decode(
         return False
 
     q_active = q[:, :active_heads]
-    if q_active.dtype != kv.dtype:
-        q_active = q_active.to(kv.dtype)
-
-    scores = torch.bmm(q_active, kv.transpose(1, 2)).float()
+    # Match the direct sparse MLA kernels, which accumulate q·k in fp32.
+    # BF16 score accumulation is fast but too imprecise for DeepSeek V4 decode
+    # on SM120 and causes unstable generations.
+    scores = torch.bmm(q_active.float(), kv.float().transpose(1, 2))
     scores.mul_(scale)
     block_d = 32
     grid = (q.shape[0] * active_heads, triton.cdiv(q.shape[-1], block_d))
@@ -487,10 +492,10 @@ def matmul_sparse_mla_attention_with_sink(
         return
 
     q_active = q[:, :active_heads]
-    if q_active.dtype != kv.dtype:
-        q_active = q_active.to(kv.dtype)
-
-    scores = torch.bmm(q_active, kv.transpose(1, 2)).float()
+    kv_float = kv.float()
+    # Match the direct sparse MLA kernels, which accumulate q·k and attention
+    # values in fp32. BF16 matmul here is fast but corrupts decode quality.
+    scores = torch.bmm(q_active.float(), kv_float.transpose(1, 2))
     scores.mul_(scale)
     scores.masked_fill_(~valid_tokens[:, None, :], float("-inf"))
     scores = torch.cat(
@@ -504,7 +509,7 @@ def matmul_sparse_mla_attention_with_sink(
     )
 
     weights = torch.softmax(scores, dim=-1)[..., : kv.shape[1]]
-    result = torch.bmm(weights.to(kv.dtype), kv)
+    result = torch.bmm(weights, kv_float)
     output[:, :active_heads].copy_(result.to(output.dtype))
     if output.shape[1] > active_heads:
         output[:, active_heads:].zero_()
