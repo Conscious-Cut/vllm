@@ -73,6 +73,11 @@ from vllm.v1.attention.backends.mla.indexer import (
 from vllm.v1.attention.backends.mla.sparse_mla_env import (
     is_triton_sparse_mla_enabled,
     triton_sparse_mla_matmul_decode_enabled,
+    triton_sparse_mla_matmul_prefill_enabled,
+    triton_sparse_mla_matmul_prefill_head_chunk_size,
+    triton_sparse_mla_matmul_prefill_head_chunk_size_configured,
+    triton_sparse_mla_matmul_prefill_query_chunk_size,
+    triton_sparse_mla_matmul_prefill_query_chunk_size_configured,
     triton_sparse_mla_query_chunk_size,
     triton_sparse_mla_topk_chunk_size,
 )
@@ -527,7 +532,9 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
                 if sub.topk_indices_buffer is not None
                 else 0
             )
-            combined_topk = sparse_prefill_combined_topk_size(top_k, sub.window_size)
+            combined_topk = sparse_prefill_combined_topk_size(
+                top_k, sub.window_size
+            )
             workspace_specs: list[tuple[tuple[int, ...], torch.dtype]] = [
                 ((PREFILL_CHUNK_SIZE, M, q.shape[-1]), torch.bfloat16),
                 ((sub.max_num_batched_tokens, combined_topk), torch.int32),
@@ -881,23 +888,54 @@ def _use_deepseek_v4_sm120_triton_fp8_einsum(
     scale_dtypes = {torch.float32}
     if e8m0_dtype is not None:
         scale_dtypes.add(e8m0_dtype)
-    return (
+    if not (
         _is_sm120_tensor(a)
         and equation == "bhr,hdr->bhd"
         and tuple(recipe) == (1, 128, 128)
         and a.dim() == 3
-        and b.dim() == 3
         and out.dim() == 3
         and a.dtype == torch.float8_e4m3fn
         and b.dtype == torch.float8_e4m3fn
         and a_scale.dtype in scale_dtypes
         and b_scale.dtype in scale_dtypes
-        and a.shape[1] == b.shape[0]
-        and a.shape[2] == b.shape[2]
-        and out.shape == (a.shape[0], a.shape[1], b.shape[1])
+        and a.shape[1] == out.shape[1]
         and a.shape[2] % 128 == 0
-        and b.shape[1] % 128 == 0
+        and out.shape[2] % 128 == 0
+    ):
+        return False
+    num_groups = a.shape[1]
+    hidden_size = a.shape[2]
+    out_rank = out.shape[2]
+    if b.dim() == 3:
+        return (
+            b.shape == (num_groups, out_rank, hidden_size)
+            and out.shape == (a.shape[0], num_groups, out_rank)
+        )
+    if b.dim() != 2:
+        return False
+    return (
+        b.shape == (num_groups * out_rank, hidden_size)
+        and b_scale.dim() == 2
+        and b_scale.shape
+        == (num_groups * (out_rank // 128), hidden_size // 128)
+        and out.shape == (a.shape[0], num_groups, out_rank)
     )
+
+
+def _reshape_deepseek_v4_sm120_fp8_einsum_weight(
+    a: torch.Tensor,
+    b: torch.Tensor,
+    b_scale: torch.Tensor,
+    out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    if b.dim() == 3:
+        return b, b_scale
+    num_groups = a.shape[1]
+    hidden_size = a.shape[2]
+    out_rank = out.shape[2]
+    b = b.reshape(num_groups, out_rank, hidden_size)
+    b_scale = b_scale.reshape(num_groups, out_rank // 128, hidden_size // 128)
+    return b, b_scale
 
 
 def deepseek_v4_fp8_einsum(
@@ -912,6 +950,9 @@ def deepseek_v4_fp8_einsum(
     if _use_deepseek_v4_sm120_triton_fp8_einsum(
         a, a_scale, b, b_scale, out, equation, recipe
     ):
+        b, b_scale = _reshape_deepseek_v4_sm120_fp8_einsum_weight(
+            a, b, b_scale, out
+        )
         deepseek_v4_sm12_fp8_einsum(a, a_scale, b, b_scale, out)
         return
     if _is_sm120_tensor(a):
@@ -1389,6 +1430,333 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             if output.shape[1] > self.num_heads:
                 output[token_start:token_end, self.num_heads :].zero_()
 
+    def _forward_sparse_mla_prefill_gathered_matmul(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        combined_indices: torch.Tensor,
+        combined_lens: torch.Tensor,
+        output: torch.Tensor,
+    ) -> bool:
+        if (
+            self.compress_ratio != 4
+            or not triton_sparse_mla_matmul_prefill_enabled()
+            or kv.shape[0] != 1
+            or q.shape[0] == 0
+            or output.shape[1] < self.num_heads
+        ):
+            return False
+
+        num_tokens = q.shape[0]
+        num_heads = self.num_heads
+        head_dim = q.shape[-1]
+        candidate_width = combined_indices.shape[-1]
+        if candidate_width <= 0:
+            return False
+
+        configured_query_chunk_size = (
+            triton_sparse_mla_matmul_prefill_query_chunk_size_configured()
+        )
+        if configured_query_chunk_size is None:
+            query_chunk_size = min(num_tokens, 256)
+        else:
+            query_chunk_size = min(
+                num_tokens,
+                triton_sparse_mla_matmul_prefill_query_chunk_size(),
+            )
+
+        kv_flat = kv.reshape(-1, head_dim)
+        candidate_offsets = torch.arange(
+            candidate_width, device=q.device, dtype=torch.int32
+        )
+        sink = self.attn_sink[:num_heads].to(torch.float32)
+        configured_head_chunk_size = (
+            triton_sparse_mla_matmul_prefill_head_chunk_size_configured()
+        )
+        if configured_head_chunk_size is None:
+            head_chunk_size = num_heads
+        else:
+            head_chunk_size = min(
+                num_heads,
+                triton_sparse_mla_matmul_prefill_head_chunk_size(),
+            )
+
+        for token_start in range(0, num_tokens, query_chunk_size):
+            token_end = min(token_start + query_chunk_size, num_tokens)
+            indices_chunk = combined_indices[token_start:token_end]
+            lens_chunk = combined_lens[token_start:token_end]
+            valid = (indices_chunk >= 0) & (
+                candidate_offsets.unsqueeze(0) < lens_chunk.unsqueeze(1)
+            )
+            safe_indices = torch.where(
+                valid,
+                indices_chunk,
+                torch.zeros((), dtype=indices_chunk.dtype, device=indices_chunk.device),
+            ).to(torch.int64)
+            gathered_kv = kv_flat[safe_indices]
+            num_chunk_tokens = token_end - token_start
+
+            for head_start in range(0, num_heads, head_chunk_size):
+                head_end = min(head_start + head_chunk_size, num_heads)
+                q_heads = q[token_start:token_end, head_start:head_end].permute(
+                    1, 0, 2
+                )
+                scores = torch.einsum(
+                    "hqd,qcd->hqc",
+                    q_heads,
+                    gathered_kv,
+                )
+                scores = scores.to(torch.float32).mul_(self.scale)
+                scores.masked_fill_(~valid.unsqueeze(0), float("-inf"))
+                sink_scores = sink[head_start:head_end].view(-1, 1, 1)
+                scores = torch.cat(
+                    [
+                        scores,
+                        sink_scores.expand(-1, num_chunk_tokens, 1),
+                    ],
+                    dim=-1,
+                )
+                weights = torch.softmax(scores, dim=-1)[:, :, :candidate_width]
+                result = torch.einsum(
+                    "hqc,qcd->hqd",
+                    weights.to(gathered_kv.dtype),
+                    gathered_kv,
+                )
+                output[token_start:token_end, head_start:head_end].copy_(
+                    result.permute(1, 0, 2).to(output.dtype)
+                )
+
+        if output.shape[1] > num_heads:
+            output[:, num_heads:].zero_()
+        return True
+
+    def _forward_sparse_mla_prefill_c128a_matmul(
+        self,
+        q: torch.Tensor,
+        kv: torch.Tensor,
+        positions: torch.Tensor,
+        combined_indices: torch.Tensor,
+        combined_lens: torch.Tensor,
+        output: torch.Tensor,
+        topk_width: int,
+        compressed_tokens: int,
+    ) -> bool:
+        if (
+            self.compress_ratio != 128
+            or not triton_sparse_mla_matmul_prefill_enabled()
+            or kv.shape[0] != 1
+            or topk_width <= 0
+            or combined_indices.shape[-1] < topk_width
+            or q.shape[0] == 0
+            or compressed_tokens < 0
+        ):
+            return False
+
+        num_tokens = q.shape[0]
+        num_heads = self.num_heads
+        head_dim = q.shape[-1]
+        if output.shape[1] < num_heads or positions.shape[0] != num_tokens:
+            return False
+
+        kv_flat = kv.reshape(-1, head_dim)
+        compressed_kv = kv_flat[:compressed_tokens]
+        max_swa_width = min(self.window_size, combined_indices.shape[-1])
+        configured_query_chunk_size = (
+            triton_sparse_mla_matmul_prefill_query_chunk_size_configured()
+        )
+        configured_head_chunk_size = (
+            triton_sparse_mla_matmul_prefill_head_chunk_size_configured()
+        )
+        base_position = int(positions[0].item())
+        last_position = int(positions[-1].item())
+        positions_are_contiguous = last_position - base_position == num_tokens - 1
+        if configured_query_chunk_size is None:
+            query_chunk_size = 512 if positions_are_contiguous else 128
+        else:
+            query_chunk_size = triton_sparse_mla_matmul_prefill_query_chunk_size()
+        query_chunk_size = min(num_tokens, query_chunk_size)
+        comp_offsets_full = torch.arange(
+            compressed_tokens, device=q.device, dtype=torch.int64
+        )
+        sink = self.attn_sink[:num_heads].to(torch.float32)
+
+        for token_start in range(0, num_tokens, query_chunk_size):
+            token_end = min(token_start + query_chunk_size, num_tokens)
+            q_chunk = q[token_start:token_end, :num_heads]
+            pos_chunk = positions[token_start:token_end].to(torch.int64)
+            combined_lens_chunk = combined_lens[token_start:token_end].to(torch.int64)
+
+            comp_lens = torch.div(
+                pos_chunk + 1,
+                self.compress_ratio,
+                rounding_mode="floor",
+            ).clamp_(min=0, max=compressed_tokens)
+            if positions_are_contiguous:
+                chunk_first_position = base_position + token_start
+                chunk_last_position = base_position + token_end - 1
+            else:
+                chunk_first_position = int(positions[token_start].item())
+                chunk_last_position = int(positions[token_end - 1].item())
+            chunk_compressed_tokens = min(
+                compressed_tokens,
+                max(0, (chunk_last_position + 1) // self.compress_ratio),
+            )
+
+            if chunk_compressed_tokens > 0:
+                compressed_kv_chunk = compressed_kv[:chunk_compressed_tokens]
+                first_compressed_tokens = min(
+                    compressed_tokens,
+                    max(0, (chunk_first_position + 1) // self.compress_ratio),
+                )
+                boundary_mask_columns: range | None = None
+                use_boundary_mask = positions_are_contiguous
+                if use_boundary_mask:
+                    boundary_mask_columns = range(
+                        first_compressed_tokens, chunk_compressed_tokens
+                    )
+                    comp_valid = None
+                else:
+                    comp_offsets = comp_offsets_full[:chunk_compressed_tokens]
+                    comp_valid = comp_offsets.unsqueeze(0) < comp_lens.unsqueeze(1)
+            else:
+                compressed_kv_chunk = compressed_kv[:0]
+                boundary_mask_columns = None
+                comp_valid = None
+
+            if max_swa_width > 0:
+                swa_lens = (combined_lens_chunk - comp_lens).clamp_(min=0)
+                swa_lens = swa_lens.clamp_(max=max_swa_width).to(torch.int64)
+                combined_indices_chunk = combined_indices[token_start:token_end]
+                swa_offsets = torch.arange(
+                    max_swa_width, device=q.device, dtype=torch.int64
+                )
+                swa_gather_offsets = comp_lens.unsqueeze(1) + swa_offsets.unsqueeze(0)
+                swa_valid = (swa_offsets.unsqueeze(0) < swa_lens.unsqueeze(1)) & (
+                    swa_gather_offsets < combined_indices.shape[-1]
+                )
+                safe_gather_offsets = torch.where(
+                    swa_valid,
+                    swa_gather_offsets,
+                    torch.zeros(
+                        (),
+                        dtype=swa_gather_offsets.dtype,
+                        device=swa_gather_offsets.device,
+                    ),
+                )
+                swa_indices = torch.gather(
+                    combined_indices_chunk,
+                    1,
+                    safe_gather_offsets,
+                )
+                swa_valid = swa_valid & (swa_indices >= 0)
+                safe_swa_indices = torch.where(
+                    swa_valid,
+                    swa_indices,
+                    torch.zeros(
+                        (),
+                        dtype=swa_indices.dtype,
+                        device=swa_indices.device,
+                    ),
+                ).to(torch.int64)
+                swa_kv = kv_flat[safe_swa_indices]
+            else:
+                swa_valid = None
+                swa_kv = None
+
+            if configured_head_chunk_size is None:
+                if num_heads >= 64 and chunk_compressed_tokens <= 1024:
+                    head_chunk_size = 64
+                elif chunk_compressed_tokens <= 2048:
+                    head_chunk_size = 16
+                elif chunk_compressed_tokens <= 4096:
+                    head_chunk_size = 8
+                else:
+                    head_chunk_size = 4
+            else:
+                head_chunk_size = triton_sparse_mla_matmul_prefill_head_chunk_size()
+            head_chunk_size = min(num_heads, head_chunk_size)
+
+            for head_start in range(0, num_heads, head_chunk_size):
+                head_end = min(head_start + head_chunk_size, num_heads)
+                q_heads = q_chunk[:, head_start:head_end].permute(1, 0, 2)
+                score_parts: list[torch.Tensor] = []
+
+                if chunk_compressed_tokens > 0:
+                    comp_scores = torch.matmul(q_heads, compressed_kv_chunk.T)
+                    comp_scores = comp_scores.to(torch.float32).mul_(self.scale)
+                    if comp_valid is not None:
+                        comp_scores.masked_fill_(
+                            ~comp_valid.unsqueeze(0), float("-inf")
+                        )
+                    elif boundary_mask_columns is not None:
+                        for column in boundary_mask_columns:
+                            first_valid_row = (
+                                (column + 1) * self.compress_ratio
+                                - 1
+                                - chunk_first_position
+                            )
+                            if first_valid_row > 0:
+                                comp_scores[
+                                    :, : min(first_valid_row, token_end - token_start), column
+                                ].fill_(float("-inf"))
+                    score_parts.append(comp_scores)
+
+                if swa_valid is not None and swa_kv is not None:
+                    assert swa_valid is not None
+                    assert swa_kv is not None
+                    if swa_kv.dim() == 2:
+                        swa_scores = torch.matmul(q_heads, swa_kv.T)
+                    else:
+                        swa_scores = torch.einsum("hqd,qsd->hqs", q_heads, swa_kv)
+                    swa_scores = swa_scores.to(torch.float32).mul_(self.scale)
+                    swa_scores.masked_fill_(~swa_valid.unsqueeze(0), float("-inf"))
+                    score_parts.append(swa_scores)
+
+                sink_scores = sink[head_start:head_end].view(-1, 1, 1)
+                score_parts.append(
+                    sink_scores.expand(-1, token_end - token_start, 1)
+                )
+                scores = torch.cat(score_parts, dim=-1)
+                weights = torch.softmax(scores, dim=-1)
+
+                offset = 0
+                result = torch.zeros(
+                    (head_end - head_start, token_end - token_start, head_dim),
+                    device=q.device,
+                    dtype=torch.float32,
+                )
+                if chunk_compressed_tokens > 0:
+                    comp_weights = weights[
+                        :, :, offset : offset + chunk_compressed_tokens
+                    ]
+                    comp_result = torch.matmul(
+                        comp_weights.to(compressed_kv_chunk.dtype), compressed_kv_chunk
+                    )
+                    result.add_(comp_result.to(torch.float32))
+                    offset += chunk_compressed_tokens
+
+                if swa_valid is not None and swa_kv is not None:
+                    assert swa_kv is not None
+                    swa_width = swa_valid.shape[-1]
+                    swa_weights = weights[:, :, offset : offset + swa_width]
+                    if swa_kv.dim() == 2:
+                        swa_result = torch.matmul(
+                            swa_weights.to(swa_kv.dtype), swa_kv
+                        )
+                    else:
+                        swa_result = torch.einsum(
+                            "hqs,qsd->hqd", swa_weights.to(swa_kv.dtype), swa_kv
+                        )
+                    result.add_(swa_result.to(torch.float32))
+
+                output[token_start:token_end, head_start:head_end].copy_(
+                    result.permute(1, 0, 2).to(output.dtype)
+                )
+
+        if output.shape[1] > num_heads:
+            output[:, num_heads:].zero_()
+        return True
+
     def forward(
         self,
         q: torch.Tensor,
@@ -1708,8 +2076,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             max_query_chunk_tokens = max(
                 max_query_chunk_tokens, int(query_end - query_start)
             )
-        combined_topk = sparse_prefill_combined_topk_size(top_k, self.window_size)
         triton_sparse_mla_enabled = is_triton_sparse_mla_enabled(q.device)
+        combined_topk = sparse_prefill_combined_topk_size(
+            top_k, self.window_size
+        )
         if triton_sparse_mla_enabled:
             query_chunk_size = min(q.shape[0], triton_sparse_mla_query_chunk_size())
             (
@@ -1747,6 +2117,12 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             chunk_start = chunk_idx * PREFILL_CHUNK_SIZE
             chunk_end = min(chunk_start + PREFILL_CHUNK_SIZE, num_prefills)
             chunk_size = chunk_end - chunk_start
+            query_start = (
+                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
+            )
+            query_end = (
+                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
+            )
             if not swa_only:
                 # Gather compressed KV
                 assert attn_metadata is not None
@@ -1773,14 +2149,7 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 offset=N,
             )
 
-            # Combine the topk indices and SWA indices for gathered KV cache
-            query_start = (
-                query_start_loc_cpu[num_decodes + chunk_start] - prefill_token_base
-            )
-            query_end = (
-                query_start_loc_cpu[num_decodes + chunk_end] - prefill_token_base
-            )
-
+            # Combine the topk indices and SWA indices for gathered KV cache.
             query_tokens = query_end - query_start
             combined_indices, combined_lens = combine_topk_swa_indices(
                 topk_indices[query_start:query_end],
@@ -1799,6 +2168,25 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             )
 
             if triton_sparse_mla_enabled:
+                if self._forward_sparse_mla_prefill_gathered_matmul(
+                    q=q[query_start:query_end],
+                    kv=kv[:chunk_size],
+                    combined_indices=combined_indices,
+                    combined_lens=combined_lens,
+                    output=output[query_start:query_end],
+                ):
+                    continue
+                if self._forward_sparse_mla_prefill_c128a_matmul(
+                    q=q[query_start:query_end],
+                    kv=kv[:chunk_size],
+                    positions=positions[query_start:query_end],
+                    combined_indices=combined_indices,
+                    combined_lens=combined_lens,
+                    output=output[query_start:query_end],
+                    topk_width=top_k,
+                    compressed_tokens=N,
+                ):
+                    continue
                 self._forward_sparse_mla_prefill_triton(
                     q=q[query_start:query_end],
                     kv=kv[:chunk_size],

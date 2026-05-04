@@ -71,6 +71,9 @@ if TYPE_CHECKING:
     VLLM_TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH: bool = True
     VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE: int | None = None
     VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE: bool = True
+    VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL: bool = True
+    VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL_QUERY_CHUNK_SIZE: int = 128
+    VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL_HEAD_CHUNK_SIZE: int | None = None
     VLLM_ASSETS_CACHE: str = os.path.join(VLLM_CACHE_ROOT, "assets")
     VLLM_ASSETS_CACHE_MODEL_CLEAN: bool = False
     VLLM_IMAGE_FETCH_TIMEOUT: int = 5
@@ -936,6 +939,17 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE": lambda: bool(
         int(os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE", "1"))
+    ),
+    "VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL": lambda: bool(
+        int(os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL", "1"))
+    ),
+    "VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL_QUERY_CHUNK_SIZE": lambda: int(
+        os.getenv("VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL_QUERY_CHUNK_SIZE", "128")
+    ),
+    "VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL_HEAD_CHUNK_SIZE": lambda: (
+        int(os.environ["VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL_HEAD_CHUNK_SIZE"])
+        if "VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL_HEAD_CHUNK_SIZE" in os.environ
+        else None
     ),
     # If set, the OpenAI API server will stay alive even after the underlying
     # AsyncLLMEngine errors and stops serving requests

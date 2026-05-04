@@ -86,7 +86,9 @@ class DeepGemmFp8BlockScaledMMKernel(Fp8BlockScaledMMLinearKernel):
         params = self._get_layer_params(layer)
         assert layer.weight_block_size is not None
 
-        if self.is_deep_gemm_supported:
+        if self.is_deep_gemm_supported and not getattr(
+            layer, "disable_deep_gemm_post_process", False
+        ):
             weight_scale_invs = params.weight_scale_inv
             scale_attr = (
                 params.WEIGHT_SCALE_INV

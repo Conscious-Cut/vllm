@@ -43,6 +43,7 @@ from .deepseek_v4 import (
     hc_head,
     make_deepseek_v4_expert_params_mapping,
 )
+from .interfaces import SupportsPP
 from .utils import maybe_prefix
 
 logger = init_logger(__name__)
@@ -241,7 +242,7 @@ class DeepSeekV4MultiTokenPredictor(nn.Module):
 
 
 @support_torch_compile
-class DeepSeekV4MTP(nn.Module):
+class DeepSeekV4MTP(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config

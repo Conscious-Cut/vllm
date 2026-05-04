@@ -510,21 +510,13 @@ class GPUModelRunner(
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
         self.use_aux_hidden_state_outputs = False
+        self.drafter: Any | None = None
+        self.rejection_sampler: RejectionSampler | None = None
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
         # layers in the draft model.
         if self.speculative_config and get_pp_group().is_last_rank:
-            self.drafter: (
-                NgramProposer  # noqa: F823
-                | NgramProposerGPU
-                | SuffixDecodingProposer
-                | EagleProposer
-                | DFlashProposer
-                | DraftModelProposer
-                | MedusaProposer
-                | ExtractHiddenStatesProposer
-            )
             if self.speculative_config.method == "ngram":
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
 
@@ -1718,13 +1710,36 @@ class GPUModelRunner(
         )
 
         # Scatter the draft tokens after the sampled tokens are scattered.
-        if self._draft_token_ids is None or not spec_flattened_indices:
+        if not spec_flattened_indices:
+            return
+
+        draft_tokens_index_cpu = torch.tensor(
+            spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
+        )
+        draft_tokens_index_tensor = draft_tokens_index_cpu.to(
+            self.device, non_blocking=True
+        )
+        if self._draft_token_ids is None:
+            # PP non-last ranks do not own the drafter. The scheduler has
+            # already written scheduled draft token IDs into input_ids.cpu.
+            self.input_ids.gpu.scatter_(
+                dim=0,
+                index=draft_tokens_index_tensor,
+                src=self.input_ids.cpu[draft_tokens_index_cpu].to(
+                    self.device, non_blocking=True
+                ),
+            )
+            if self.enable_prompt_embeds:
+                self.is_token_ids.gpu.scatter_(
+                    dim=0,
+                    index=draft_tokens_index_tensor,
+                    src=self.is_token_ids.cpu[draft_tokens_index_cpu].to(
+                        self.device, non_blocking=True
+                    ),
+                )
             return
 
         assert isinstance(self._draft_token_ids, torch.Tensor)
-        draft_tokens_index_tensor = torch.tensor(
-            spec_flattened_indices, dtype=torch.int64, pin_memory=self.pin_memory
-        ).to(self.device, non_blocking=True)
         prev_draft_token_indices_tensor = torch.tensor(
             prev_draft_token_indices, dtype=torch.int64, pin_memory=self.pin_memory
         ).to(self.device, non_blocking=True)
@@ -3386,6 +3401,7 @@ class GPUModelRunner(
             draft_token_ids_cpu, _ = self._get_draft_token_ids_cpu()
             self.input_batch.update_async_spec_token_ids(draft_token_ids_cpu)
 
+        assert self.rejection_sampler is not None
         sampler_output = self.rejection_sampler(
             spec_decode_metadata,
             None,  # draft_probs
@@ -4420,6 +4436,8 @@ class GPUModelRunner(
         pp = get_pp_group()
         assert pp.is_last_rank
         # `prev_sampled_token_ids` is expected to have shape [num_reqs, 1].
+        if sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] > 1:
+            sampled_token_ids = sampled_token_ids[:, :1].contiguous()
         assert sampled_token_ids.dim() == 2 and sampled_token_ids.shape[-1] == 1, (
             "PP+async expects sampled_token_ids to have shape [num_reqs, 1]"
         )
@@ -4835,7 +4853,7 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
-                if hasattr(self, "drafter"):
+                if self.drafter is not None:
                     logger.info_once("Loading drafter model...")
                     self.drafter.load_model(self.model)
                     if (
@@ -5589,7 +5607,7 @@ class GPUModelRunner(
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
-            ):
+            ) and get_pp_group().is_last_rank:
                 assert isinstance(
                     self.drafter,
                     EagleProposer
@@ -5748,6 +5766,7 @@ class GPUModelRunner(
                 device=self.device,
                 dtype=logits.dtype,
             )
+            assert self.rejection_sampler is not None
             self.rejection_sampler(
                 dummy_spec_decode_metadata,
                 draft_probs,
@@ -6394,7 +6413,7 @@ class GPUModelRunner(
         if self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
-        ):
+        ) and get_pp_group().is_last_rank:
             assert isinstance(
                 self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
             )
@@ -6446,7 +6465,7 @@ class GPUModelRunner(
         if self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_extract_hidden_states()
-        ):
+        ) and get_pp_group().is_last_rank:
             assert isinstance(
                 self.drafter,
                 EagleProposer | DFlashProposer | ExtractHiddenStatesProposer,

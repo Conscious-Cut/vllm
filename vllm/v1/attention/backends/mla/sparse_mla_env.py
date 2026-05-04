@@ -19,6 +19,13 @@ _TRITON_MLA_SPARSE_ALLOW_CUDAGRAPH_ENV = (
 )
 _TRITON_MLA_SPARSE_HEAD_BLOCK_ENV = "VLLM_TRITON_MLA_SPARSE_HEAD_BLOCK_SIZE"
 _TRITON_MLA_SPARSE_MATMUL_DECODE_ENV = "VLLM_TRITON_MLA_SPARSE_MATMUL_DECODE"
+_TRITON_MLA_SPARSE_MATMUL_PREFILL_ENV = "VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL"
+_TRITON_MLA_SPARSE_MATMUL_PREFILL_QUERY_CHUNK_ENV = (
+    "VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL_QUERY_CHUNK_SIZE"
+)
+_TRITON_MLA_SPARSE_MATMUL_PREFILL_HEAD_CHUNK_ENV = (
+    "VLLM_TRITON_MLA_SPARSE_MATMUL_PREFILL_HEAD_CHUNK_SIZE"
+)
 
 _ENV_TRUE_VALUES = {"1", "true", "yes", "on"}
 _ENV_FALSE_VALUES = {"0", "false", "no", "off"}
@@ -164,3 +171,46 @@ def triton_sparse_mla_matmul_decode_enabled() -> bool:
     if configured is not None:
         return configured
     return current_platform.is_device_capability_family(120)
+
+
+def triton_sparse_mla_matmul_prefill_enabled() -> bool:
+    configured = _optional_env_flag(_TRITON_MLA_SPARSE_MATMUL_PREFILL_ENV)
+    if configured is not None:
+        return configured
+    return current_platform.is_device_capability_family(120)
+
+
+def triton_sparse_mla_matmul_prefill_query_chunk_size_configured() -> int | None:
+    raw_value = os.getenv(_TRITON_MLA_SPARSE_MATMUL_PREFILL_QUERY_CHUNK_ENV)
+    if raw_value is None:
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return None
+    return max(1, value)
+
+
+def triton_sparse_mla_matmul_prefill_query_chunk_size() -> int:
+    configured = triton_sparse_mla_matmul_prefill_query_chunk_size_configured()
+    if configured is None:
+        return 128
+    return configured
+
+
+def triton_sparse_mla_matmul_prefill_head_chunk_size_configured() -> int | None:
+    raw_value = os.getenv(_TRITON_MLA_SPARSE_MATMUL_PREFILL_HEAD_CHUNK_ENV)
+    if raw_value is None:
+        return None
+    try:
+        value = int(raw_value)
+    except ValueError:
+        return None
+    return max(1, value)
+
+
+def triton_sparse_mla_matmul_prefill_head_chunk_size() -> int:
+    configured = triton_sparse_mla_matmul_prefill_head_chunk_size_configured()
+    if configured is None:
+        return 16
+    return configured
