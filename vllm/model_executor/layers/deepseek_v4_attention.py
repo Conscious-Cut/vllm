@@ -1509,19 +1509,24 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                 scores = scores.to(torch.float32).mul_(self.scale)
                 scores.masked_fill_(~valid.unsqueeze(0), float("-inf"))
                 sink_scores = sink[head_start:head_end].view(-1, 1, 1)
-                scores = torch.cat(
-                    [
-                        scores,
-                        sink_scores.expand(-1, num_chunk_tokens, 1),
-                    ],
-                    dim=-1,
+                max_score = torch.maximum(
+                    scores.amax(dim=-1, keepdim=True),
+                    sink_scores.expand(-1, num_chunk_tokens, 1),
                 )
-                weights = torch.softmax(scores, dim=-1)[:, :, :candidate_width]
+                safe_max = torch.where(
+                    torch.isfinite(max_score),
+                    max_score,
+                    torch.zeros_like(max_score),
+                )
+                scores.sub_(safe_max).exp_()
+                denom = scores.sum(dim=-1, keepdim=True)
+                denom.add_(torch.exp(sink_scores - safe_max))
                 result = torch.einsum(
                     "hqc,qcd->hqd",
-                    weights.to(gathered_kv.dtype),
+                    scores.to(gathered_kv.dtype),
                     gathered_kv,
                 )
+                result = result.to(torch.float32).div_(denom)
                 output[token_start:token_end, head_start:head_end].copy_(
                     result.permute(1, 0, 2).to(output.dtype)
                 )
@@ -1679,7 +1684,14 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
             for head_start in range(0, num_heads, head_chunk_size):
                 head_end = min(head_start + head_chunk_size, num_heads)
                 q_heads = q_chunk[:, head_start:head_end].permute(1, 0, 2)
-                score_parts: list[torch.Tensor] = []
+                sink_scores = sink[head_start:head_end].view(-1, 1, 1)
+                max_score = sink_scores.expand(
+                    -1,
+                    token_end - token_start,
+                    1,
+                ).clone()
+                comp_scores: torch.Tensor | None = None
+                swa_scores: torch.Tensor | None = None
 
                 if chunk_compressed_tokens > 0:
                     comp_scores = torch.matmul(q_heads, compressed_kv_chunk.T)
@@ -1699,7 +1711,10 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                                 comp_scores[
                                     :, : min(first_valid_row, token_end - token_start), column
                                 ].fill_(float("-inf"))
-                    score_parts.append(comp_scores)
+                    max_score = torch.maximum(
+                        max_score,
+                        comp_scores.amax(dim=-1, keepdim=True),
+                    )
 
                 if swa_valid is not None and swa_kv is not None:
                     assert swa_valid is not None
@@ -1710,45 +1725,50 @@ class DeepseekV4MLAAttention(nn.Module, AttentionLayerBase):
                         swa_scores = torch.einsum("hqd,qsd->hqs", q_heads, swa_kv)
                     swa_scores = swa_scores.to(torch.float32).mul_(self.scale)
                     swa_scores.masked_fill_(~swa_valid.unsqueeze(0), float("-inf"))
-                    score_parts.append(swa_scores)
+                    max_score = torch.maximum(
+                        max_score,
+                        swa_scores.amax(dim=-1, keepdim=True),
+                    )
 
-                sink_scores = sink[head_start:head_end].view(-1, 1, 1)
-                score_parts.append(
-                    sink_scores.expand(-1, token_end - token_start, 1)
+                safe_max = torch.where(
+                    torch.isfinite(max_score),
+                    max_score,
+                    torch.zeros_like(max_score),
                 )
-                scores = torch.cat(score_parts, dim=-1)
-                weights = torch.softmax(scores, dim=-1)
+                denom = torch.exp(sink_scores - safe_max)
 
-                offset = 0
                 result = torch.zeros(
                     (head_end - head_start, token_end - token_start, head_dim),
                     device=q.device,
                     dtype=torch.float32,
                 )
-                if chunk_compressed_tokens > 0:
-                    comp_weights = weights[
-                        :, :, offset : offset + chunk_compressed_tokens
-                    ]
+                if comp_scores is not None:
+                    comp_scores.sub_(safe_max).exp_()
+                    denom.add_(comp_scores.sum(dim=-1, keepdim=True))
                     comp_result = torch.matmul(
-                        comp_weights.to(compressed_kv_chunk.dtype), compressed_kv_chunk
+                        comp_scores.to(compressed_kv_chunk.dtype),
+                        compressed_kv_chunk,
                     )
                     result.add_(comp_result.to(torch.float32))
-                    offset += chunk_compressed_tokens
 
-                if swa_valid is not None and swa_kv is not None:
+                if swa_scores is not None and swa_kv is not None:
                     assert swa_kv is not None
-                    swa_width = swa_valid.shape[-1]
-                    swa_weights = weights[:, :, offset : offset + swa_width]
+                    swa_scores.sub_(safe_max).exp_()
+                    denom.add_(swa_scores.sum(dim=-1, keepdim=True))
                     if swa_kv.dim() == 2:
                         swa_result = torch.matmul(
-                            swa_weights.to(swa_kv.dtype), swa_kv
+                            swa_scores.to(swa_kv.dtype),
+                            swa_kv,
                         )
                     else:
                         swa_result = torch.einsum(
-                            "hqs,qsd->hqd", swa_weights.to(swa_kv.dtype), swa_kv
+                            "hqs,qsd->hqd",
+                            swa_scores.to(swa_kv.dtype),
+                            swa_kv,
                         )
                     result.add_(swa_result.to(torch.float32))
 
+                result.div_(denom)
                 output[token_start:token_end, head_start:head_end].copy_(
                     result.permute(1, 0, 2).to(output.dtype)
                 )
